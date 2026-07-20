@@ -22,7 +22,14 @@ pub struct RelayOpts {
 
 #[actix_rt::main]
 pub async fn relay(config: &PathBuf, watch: bool) -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // Not `fmt::init()`: its default level flips to RUST_LOG-only whenever a
+    // workspace member pulls in `env-filter`, silencing the relay.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     info!("Start relay server");
 
     // actix_rt::System::new().block_on(async {

@@ -25,14 +25,15 @@ nostr-extensions = { version = "0.4.9", path = "./extensions" }
 rayon = "1.10.0"
 thiserror = "1.0.63"
 tracing = "0.1.40"
-tracing-subscriber = "0.3.18"
+# Explicit, not inherited from a workspace member: src/relay.rs needs it.
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
 # [features]
 # zstd = ["nostr-db/zstd"]
 
 [workspace]
 
-members = ["kv", "kv/bench", "db", "db/bench", "relay", "extensions"]
+members = ["kv", "kv/bench", "db", "db/bench", "relay", "extensions", "allowlist-sync"]
 
 [workspace.package]
 edition = "2021"

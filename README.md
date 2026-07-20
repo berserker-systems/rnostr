@@ -48,6 +48,9 @@ Provide metrics url for [prometheus](https://prometheus.io/) scrape
 
 [NIP-42](https://nips.be/42) Authentication, ip, auth pubkey and event pubkey whitelist blacklist
 
+See [allowlist sync](#allowlist-sync) for keeping the auth whitelists in sync
+with a private shareholder registry.
+
 #### Rate limiter
 
 Limit event write frequency.
@@ -122,6 +125,48 @@ docker build . -t rnostr/rnostr --build-arg BASE=mirror_cn
 ```
 
 See docker compose [example](./docker-compose.yml)
+
+### Allowlist sync
+
+`allowlist-sync` is a separate binary that keeps the `[auth]` pubkey whitelists
+in `rnostr.toml` in sync with the private kind-30617 snapshots published by
+`shareholder-governance-registry`. It authenticates as the registry operator,
+fetches the self-addressed event, decrypts its NIP-44 v2 content, and parses the
+JSON array of shareholder npubs. The effective allowlist is the registry
+operator, the dedicated sync recipient, those shareholders, and any local
+`--extra-pubkey` keys. It rewrites the config atomically, so run the relay with
+`--watch` to pick up changes without a restart.
+
+The recipient nsec file contains a dedicated allowlist-sync identity. Configure
+its public key as `nostr.allowlist_sync_pubkey` in
+`shareholder-governance-registry`; the registry then publishes a copy to it on
+every update, even when the shareholder set becomes empty. Keep the nsec file
+readable only by the sidecar service account.
+
+For initial bootstrap, pre-allow the sync public key on the managed relay or
+fetch from an independent relay. After the first successful sync, the sidecar
+keeps its own public key in both managed whitelists.
+
+```shell
+
+cargo build --release
+./target/release/allowlist-sync --help
+
+# One-shot: fetch, decrypt, apply, and exit. Exits non-zero if no snapshot is found.
+./target/release/allowlist-sync \
+    --authority npub1_registry_operator... \
+    --recipient-nsec-file /etc/rnostr/allowlist-sync.nsec \
+    --relay wss://relay.example.com \
+    --config ./config/rnostr.toml \
+    --once
+
+```
+
+Every flag also has an environment variable. See the annotated
+[allowlist-sync.example.env](./allowlist-sync.example.env) for the full list
+with defaults and deployment caveats, and
+[allowlist-sync.service](./allowlist-sync.service) for a
+systemd unit that uses it.
 
 ### Commands
 

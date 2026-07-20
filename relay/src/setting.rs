@@ -252,12 +252,16 @@ impl SettingWrapper {
         let mut watcher = RecommendedWatcher::new(
             move |result: Result<Event, notify::Error>| match result {
                 Ok(event) => {
-                    #[cfg(target_os = "windows")]
-                    // There is no distinction between data writes or metadata writes. Both of these are represented by Modify(Any).
-                    let is_modify = matches!(event.kind, EventKind::Modify(ModifyKind::Any));
-                    #[cfg(not(target_os = "windows"))]
-                    let is_modify = matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)));
-                    if is_modify && event.paths.contains(&c_file) {
+                    // Editors and sidecars commonly update configs with an
+                    // atomic rename. Watch the parent directory and accept the
+                    // resulting create/name event as well as in-place writes.
+                    let should_reload = matches!(
+                        event.kind,
+                        EventKind::Modify(
+                            ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Name(_)
+                        ) | EventKind::Create(_)
+                    );
+                    if should_reload && event.paths.contains(&c_file) {
                         match c_setting.reload(&c_file, env_prefix.clone()) {
                             Ok(_) => {
                                 info!("Reload config success {:?}", c_file);
@@ -531,6 +535,21 @@ mod tests {
             let r = setting.read();
             assert_eq!(r.information.name, "nostr");
             assert!(r.information.supported_nips.contains(&1));
+        }
+
+        {
+            let replacement = file.path().with_extension("replacement");
+            fs::write(
+                &replacement,
+                r#"[information]
+    name = "atomic"
+    "#,
+            )?;
+            fs::rename(replacement, file.path())?;
+            sleep(Duration::from_secs(1));
+
+            let r = setting.read();
+            assert_eq!(r.information.name, "atomic");
         }
         Ok(())
     }
