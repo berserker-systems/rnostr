@@ -10,6 +10,8 @@ authors.workspace = true
 
 
 [dependencies]
+allowlist-policy = { version = "0.4.9", path = "../allowlist-policy" }
+notify = "6.1.1"
 
 nostr-relay = { version = "0.4.9", path = "../relay", default-features = false }
 metrics = "0.23.0"

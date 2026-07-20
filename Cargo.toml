@@ -50,7 +50,7 @@ search-korean = [
 
 [workspace]
 
-members = ["kv", "kv/bench", "db", "db/bench", "relay", "extensions"]
+members = ["kv", "kv/bench", "db", "db/bench", "relay", "extensions", "allowlist-sync", "allowlist-policy"]
 
 [workspace.package]
 edition = "2021"

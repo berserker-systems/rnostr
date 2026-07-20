@@ -60,6 +60,8 @@ Read permission changes apply to open subscriptions on their next event delivery
 Blocked connections close with WebSocket policy code 1008. Clients needing
 authentication receive `CLOSED auth-required:` and can authenticate and resubscribe.
 
+See [allowlist sync](#allowlist-sync) for membership from a private shareholder registry.
+
 #### Rate limiter
 
 Limit event write frequency.
@@ -157,6 +159,63 @@ docker build . -t rnostr/rnostr --build-arg BASE=mirror_cn
 ```
 
 See docker compose [example](./docker-compose.yml)
+
+### Allowlist sync
+
+`allowlist-sync` fetches encrypted kind-30617 snapshots using a dedicated
+recipient key. Register its public key as `nostr.allowlist_sync_pubkey` in
+`shareholder-governance-registry`.
+
+Create the service account (replace `rnostr` with your relay user):
+
+```sh
+sudo groupadd --system rnostr-policy
+sudo useradd --system --gid rnostr-policy --no-create-home --shell /usr/sbin/nologin allowlist-sync
+sudo usermod --append --groups rnostr-policy rnostr
+```
+
+Restart the relay for group membership changes. Keep the nsec owned by
+`allowlist-sync` (0600), the policy group-readable (0640), and one writer per policy.
+
+Configure `/etc/rnostr/allowlist-sync.env` from the [example](./allowlist-sync.example.env).
+Use `--relay` for authenticated sources and `--public-relay` for public sources.
+
+```sh
+cargo build --release -p allowlist-sync
+sudo install -Dm755 target/release/allowlist-sync /opt/rnostr/allowlist-sync
+sudo install -m644 allowlist-sync.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now allowlist-sync
+```
+
+Wait for `/var/lib/allowlist-sync/allowlist.json` before enabling registry auth:
+
+```toml
+[auth]
+enabled = true
+registry_file = "/var/lib/allowlist-sync/allowlist.json"
+```
+
+Relative `registry_file` paths use the relay's working directory. File symlinks are
+rejected; restart both services after retargeting directory symlinks.
+
+For key, authority or event-kind changes, register any new recipient and choose
+a new policy, e.g. `ALLOWLIST_POLICY_FILE=/var/lib/allowlist-sync/allowlist-2.json`.
+The unit restricts writes to that directory. Restart the sidecar; once ready, update
+`auth.registry_file` and save with `--watch` or restart the relay. Cut over promptly:
+the old file stops updating. Retain it for its source's version floor if switching back.
+
+The operator, sync recipient, members and extras are allowed. Reads require
+NIP-42 auth; writes check the author, permitting unauthenticated rebroadcasts.
+Static restrictions still apply. NIP-59 gift wraps (including NIP-17 DMs) are
+unsupported. `ALLOWLIST_EXTRA_PUBKEYS` grants trusted service keys read and write access.
+
+Policy updates do not require `--watch`; a 60-second poll recovers missed notifications.
+Invalid files retain the last valid policy. Startup requires a valid policy and watcher;
+invalid new registry paths reject config reloads. Only the sidecar enforces version ordering.
+
+Malformed member keys are skipped; other invalid snapshots and incoming timestamps
+over 15 minutes ahead are rejected. Sources may serve stale snapshots.
 
 ### Commands
 

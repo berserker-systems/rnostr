@@ -32,6 +32,7 @@ jobs:
             -p nostr-relay,
             -p nostr-extensions,
             -p rnostr,
+            -p allowlist-sync -p allowlist-policy,
           ]
     steps:
       - uses: actions/checkout@v3
