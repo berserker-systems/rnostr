@@ -169,12 +169,20 @@ impl Session {
     }
 }
 
-/// Handle messages from server, we simply send it to peer websocket
+/// Recheck delivery permissions before forwarding messages to the websocket.
 impl Handler<OutgoingMessage> for Session {
     type Result = ();
 
     fn handle(&mut self, msg: OutgoingMessage, ctx: &mut Self::Context) {
-        ctx.text(msg);
+        if self
+            .app
+            .clone()
+            .extensions
+            .read()
+            .call_outgoing(&msg, self, ctx)
+        {
+            ctx.text(msg);
+        }
     }
 }
 

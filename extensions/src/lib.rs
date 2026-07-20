@@ -1,3 +1,5 @@
+mod registry;
+
 pub mod auth;
 pub use auth::Auth;
 

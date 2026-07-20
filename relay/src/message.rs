@@ -231,6 +231,17 @@ pub struct Subscription {
 pub struct OutgoingMessage(pub String);
 
 impl OutgoingMessage {
+    pub fn is_event(&self) -> bool {
+        self.0.starts_with("[\"EVENT\",")
+            || self.0.trim_start().strip_prefix('[').is_some_and(|rest| {
+                serde_json::Deserializer::from_str(rest)
+                    .into_iter::<String>()
+                    .next()
+                    .and_then(Result::ok)
+                    .as_deref()
+                    == Some("EVENT")
+            })
+    }
     pub fn notice(message: &str) -> Self {
         Self(json!(["NOTICE", message]).to_string())
     }
@@ -397,6 +408,22 @@ mod tests {
         assert!(matches!(msg, IncomingMessage::Count(sub) if sub.id == "sub_id1"));
 
         Ok(())
+    }
+
+    #[test]
+    fn event_commands_accept_legacy_wire_encodings() {
+        for wire in [
+            r#"["EVENT","sub",{}]"#,
+            " \n[ \"EVENT\" , \"sub\", {} ]",
+            r#"["\u0045VENT", "sub", {}]"#,
+        ] {
+            assert!(OutgoingMessage(wire.into()).is_event(), "{wire}");
+        }
+        let nested = "[".repeat(150) + "0" + &"]".repeat(150);
+        assert!(OutgoingMessage(format!("[ \"EVENT\", \"sub\", {nested} ]")).is_event());
+        for wire in [r#"["NOTICE","EVENT"]"#, r#"["EVENTUAL"]"#, "not JSON"] {
+            assert!(!OutgoingMessage(wire.into()).is_event());
+        }
     }
 
     #[test]

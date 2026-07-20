@@ -1,15 +1,19 @@
+use crate::registry::RegistryWatcher;
+use actix::ActorContext;
+use actix_web_actors::ws::{CloseCode, CloseReason};
 use metrics::{counter, describe_counter};
 use nostr_relay::db::now;
 use nostr_relay::{
     message::{ClientMessage, IncomingMessage, OutgoingMessage},
-    setting::SettingWrapper,
     Extension, ExtensionMessageResult, List, Session,
 };
-use serde::Deserialize;
 use uuid::Uuid;
 
+use serde::Deserialize;
+use std::path::PathBuf;
+
 #[derive(Deserialize, Default, Debug)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Permission {
     pub ip_whitelist: Option<List>,
     pub pubkey_whitelist: Option<List>,
@@ -35,16 +39,54 @@ impl Permission {
 #[serde(default)]
 pub struct AuthSetting {
     pub enabled: bool,
-    /// read auth: ["REQ"]
+    /// Read auth: ["REQ"].
     pub req: Option<Permission>,
-    /// write auth: ["EVENT"]
+    /// Write auth: ["EVENT"].
     pub event: Option<Permission>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct AuthConfig {
+    enabled: bool,
+    registry_file: Option<PathBuf>,
+    req: Option<Permission>,
+    event: Option<Permission>,
 }
 
 #[derive(Default, Debug)]
 pub struct Auth {
     setting: AuthSetting,
+    registry: Option<RegistryWatcher>,
+    initialized: bool,
 }
+
+#[derive(Clone, Copy, Debug)]
+enum Denial {
+    AuthenticationRequired,
+    Restricted(&'static str),
+}
+
+impl Denial {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::AuthenticationRequired => "NIP-42 auth required",
+            Self::Restricted(reason) => reason,
+        }
+    }
+}
+
+impl std::fmt::Display for Denial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let prefix = match self {
+            Self::AuthenticationRequired => "auth-required",
+            Self::Restricted(_) => "restricted",
+        };
+        write!(f, "{prefix}: {}", self.reason())
+    }
+}
+
+struct ReadGrant(bool);
 
 pub enum AuthState {
     /// The AUTH challenge
@@ -72,9 +114,64 @@ impl Auth {
             "nostr_relay_auth_unauthorized",
             "The total count of unauthorized messages"
         );
-        Self {
-            setting: AuthSetting::default(),
+        Self::default()
+    }
+
+    /// Validate startup auth settings and open the registry policy.
+    pub fn from_setting(
+        setting: &nostr_relay::setting::SettingWrapper,
+    ) -> nostr_relay::Result<Self> {
+        let mut auth = Self::new();
+        let mut setting = setting.write();
+        let next: AuthConfig = setting.try_parse_extension("auth")?;
+        if next.registry_file.is_some() && !next.enabled {
+            return Err(nostr_relay::Error::Str(
+                "auth.registry_file requires auth.enabled = true",
+            ));
         }
+        let registry = if next.enabled {
+            next.registry_file
+                .as_deref()
+                .map(RegistryWatcher::watch)
+                .transpose()?
+        } else {
+            None
+        };
+        auth.setting = AuthSetting {
+            enabled: next.enabled,
+            req: next.req,
+            event: next.event,
+        };
+        auth.registry = registry;
+        auth.initialized = true;
+        setting.freeze_extension("auth");
+        Ok(auth)
+    }
+
+    fn verify(
+        &self,
+        permission: Option<&Permission>,
+        pubkey: Option<&String>,
+        event_pubkey: Option<&String>,
+        event_tags: Option<&Vec<Vec<String>>>,
+        ip: &String,
+    ) -> Result<(), Denial> {
+        let permission = Self::check_permission(permission, pubkey, event_pubkey, event_tags, ip);
+        if matches!(permission, Err(Denial::Restricted(_))) {
+            return permission;
+        }
+        self.verify_registry(event_pubkey.or(pubkey))
+            .and(permission)
+    }
+
+    fn verify_registry(&self, pubkey: Option<&String>) -> Result<(), Denial> {
+        if let Some(registry) = &self.registry {
+            let key = pubkey.ok_or(Denial::AuthenticationRequired)?;
+            if !registry.allows(key) {
+                return Err(Denial::Restricted("pubkey not in registry policy"));
+            }
+        }
+        Ok(())
     }
 
     pub fn verify_permission(
@@ -84,15 +181,26 @@ impl Auth {
         event_tags: Option<&Vec<Vec<String>>>,
         ip: &String,
     ) -> Result<(), &'static str> {
+        Self::check_permission(permission, pubkey, event_pubkey, event_tags, ip)
+            .map_err(Denial::reason)
+    }
+
+    fn check_permission(
+        permission: Option<&Permission>,
+        pubkey: Option<&String>,
+        event_pubkey: Option<&String>,
+        event_tags: Option<&Vec<Vec<String>>>,
+        ip: &String,
+    ) -> Result<(), Denial> {
         if let Some(permission) = permission {
             if let Some(list) = &permission.ip_whitelist {
                 if !list.contains(ip) {
-                    return Err("ip not in whitelist");
+                    return Err(Denial::Restricted("ip not in whitelist"));
                 }
             }
             if let Some(list) = &permission.ip_blacklist {
                 if list.contains(ip) {
-                    return Err("ip in blacklist");
+                    return Err(Denial::Restricted("ip in blacklist"));
                 }
             }
 
@@ -110,12 +218,12 @@ impl Auth {
                             false
                         };
                     if !whitelisted_pubkey_is_mentioned && !list.contains(pubkey) {
-                        return Err("event author pubkey not in whitelist");
+                        return Err(Denial::Restricted("event author pubkey not in whitelist"));
                     }
                 }
                 if let Some(list) = &permission.event_pubkey_blacklist {
                     if list.contains(pubkey) {
-                        return Err("event author pubkey in blacklist");
+                        return Err(Denial::Restricted("event author pubkey in blacklist"));
                     }
                 }
             }
@@ -123,19 +231,19 @@ impl Auth {
             if let Some(list) = &permission.pubkey_whitelist {
                 if let Some(pubkey) = pubkey {
                     if !list.contains(pubkey) {
-                        return Err("pubkey not in whitelist");
+                        return Err(Denial::Restricted("pubkey not in whitelist"));
                     }
                 } else {
-                    return Err("NIP-42 auth required");
+                    return Err(Denial::AuthenticationRequired);
                 }
             }
             if let Some(list) = &permission.pubkey_blacklist {
                 if let Some(pubkey) = pubkey {
                     if list.contains(pubkey) {
-                        return Err("pubkey in blacklist");
+                        return Err(Denial::Restricted("pubkey in blacklist"));
                     }
                 } else {
-                    return Err("NIP-42 auth required");
+                    return Err(Denial::AuthenticationRequired);
                 }
             }
         }
@@ -148,19 +256,55 @@ impl Extension for Auth {
         "auth"
     }
 
-    fn setting(&mut self, setting: &SettingWrapper) {
-        let mut w = setting.write();
-        self.setting = w.parse_extension(self.name());
+    fn setting(&mut self, setting: &nostr_relay::setting::SettingWrapper) {
+        if !self.initialized {
+            *self = Self::from_setting(setting).expect("invalid auth settings");
+        }
+        let mut setting = setting.write();
         if self.setting.enabled {
-            w.add_nip(42);
+            setting.add_nip(42);
         }
         let restricted_writes = self.setting.enabled
-            && self
-                .setting
-                .event
-                .as_ref()
-                .is_some_and(Permission::restricts_writes);
-        w.set_restricted_writes(self.name(), restricted_writes);
+            && (self.registry.is_some()
+                || self
+                    .setting
+                    .event
+                    .as_ref()
+                    .is_some_and(Permission::restricts_writes));
+        setting.set_restricted_writes(self.name(), restricted_writes);
+    }
+
+    fn outgoing(
+        &self,
+        msg: &OutgoingMessage,
+        session: &mut Session,
+        ctx: &mut <Session as actix::Actor>::Context,
+    ) -> bool {
+        if self.setting.enabled && msg.is_event() {
+            let key = session.get::<AuthState>().and_then(|s| s.pubkey());
+            let cached = session.get::<ReadGrant>().is_some_and(|grant| grant.0);
+            // Static permissions are fixed for the session; membership stays live.
+            let allowed = if cached {
+                self.verify_registry(key)
+            } else {
+                self.verify(self.setting.req.as_ref(), key, None, None, session.ip())
+            };
+            if let Err(denial) = allowed {
+                let reason = denial.reason();
+                counter!("nostr_relay_auth_unauthorized", "command" => "REQ", "reason" => reason)
+                    .increment(1);
+                ctx.close(Some(CloseReason {
+                    code: CloseCode::Policy,
+                    description: Some(reason.into()),
+                }));
+                ctx.stop();
+                return false;
+            }
+            if !cached {
+                session.set(ReadGrant(true));
+            }
+        }
+        true
     }
 
     fn connected(&self, session: &mut Session, ctx: &mut <Session as actix::Actor>::Context) {
@@ -197,6 +341,7 @@ impl Extension for Auth {
                             for tag in event.tags() {
                                 if tag.len() > 1 && tag[0] == "challenge" && &tag[1] == challenge {
                                     session.set(AuthState::Pubkey(event.pubkey_str()));
+                                    session.set(ReadGrant(false));
                                     return OutgoingMessage::ok(&event.id_str(), true, "").into();
                                 }
                             }
@@ -210,20 +355,16 @@ impl Extension for Auth {
                     .into();
                 }
                 IncomingMessage::Event(event) => {
-                    if let Err(err) = Self::verify_permission(
+                    if let Err(err) = self.verify(
                         self.setting.event.as_ref(),
                         state.and_then(|s| s.pubkey()),
                         Some(&event.pubkey_str()),
                         Some(event.tags()),
                         session.ip(),
                     ) {
-                        counter!("nostr_relay_auth_unauthorized", "command" => "EVENT", "reason" => err).increment(1);
-                        return OutgoingMessage::ok(
-                            &event.id_str(),
-                            false,
-                            &format!("auth-required: {}", err),
-                        )
-                        .into();
+                        counter!("nostr_relay_auth_unauthorized", "command" => "EVENT", "reason" => err.reason()).increment(1);
+                        return OutgoingMessage::ok(&event.id_str(), false, &err.to_string())
+                            .into();
                     } else {
                         // check nip70 protected event
                         for tag in event.tags() {
@@ -233,7 +374,7 @@ impl Extension for Auth {
                                         return OutgoingMessage::ok(
                                             &event.id_str(),
                                             false,
-                                            "auth-required: this event may only be published by its author",
+                                            "restricted: this event may only be published by its author",
                                         )
                                         .into();
                                     }
@@ -251,17 +392,18 @@ impl Extension for Auth {
                     }
                 }
                 IncomingMessage::Req(sub) | IncomingMessage::Count(sub) => {
-                    if let Err(err) = Self::verify_permission(
+                    if let Err(err) = self.verify(
                         self.setting.req.as_ref(),
                         state.and_then(|s| s.pubkey()),
                         None,
                         None,
                         session.ip(),
                     ) {
-                        counter!("nostr_relay_auth_unauthorized", "command" => "REQ", "reason" => err).increment(1);
-                        let msg = format!("auth-required: {}", err);
+                        counter!("nostr_relay_auth_unauthorized", "command" => "REQ", "reason" => err.reason()).increment(1);
+                        let msg = err.to_string();
                         return OutgoingMessage::closed(&sub.id, &msg).into();
                     }
+                    session.set(ReadGrant(true));
                 }
                 _ => {}
             }
@@ -286,7 +428,81 @@ mod tests {
         secp256k1::{rand::thread_rng, Keypair, XOnlyPublicKey},
         Event,
     };
+    use nostr_relay::{setting::SettingWrapper, Setting};
     use serde_json::{json, Value};
+
+    #[test]
+    fn startup_rejects_invalid_auth_from_files_and_env() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("relay.json");
+        std::fs::write(&path, "{}")?;
+        temp_env::with_vars([("AUTHVALIDATION_AUTH__ENABLED", Some("invalid"))], || {
+            assert!(Setting::from_env("AUTHVALIDATION".into())
+                .and_then(|s| Auth::from_setting(&s.into()))
+                .is_err());
+            assert!(Setting::read(&path, Some("AUTHVALIDATION".into()))
+                .and_then(|s| Auth::from_setting(&s.into()))
+                .is_err());
+        });
+        std::fs::write(
+            &path,
+            serde_json::json!({"auth":{"enabled":true,"registry_file":"missing.json"}}).to_string(),
+        )?;
+        temp_env::with_vars([("AUTHVALIDATION_AUTH__ENABLED", Some("false"))], || {
+            let err = Setting::read(&path, Some("AUTHVALIDATION".into()))
+                .and_then(|s| Auth::from_setting(&s.into()))
+                .unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("auth.registry_file requires auth.enabled = true"));
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn registry_gate_requires_authenticated_reads_and_prevents_mentioning_bypass() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("policy.json");
+        let member = "d".repeat(64);
+        let extra = "e".repeat(64);
+        let outsider = "f".repeat(64);
+        std::fs::write(&file, serde_json::json!({
+            "source": {"authority": "a".repeat(64), "recipient": "b".repeat(64), "event_kind": 30617},
+            "created_at": 10, "event_id": "c".repeat(64), "members": [member], "extras": [extra]
+        }).to_string())?;
+        let mut setting = nostr_relay::Setting::default();
+        setting.extra.insert(
+            "auth".into(),
+            serde_json::json!({"enabled": true, "registry_file": file}),
+        );
+        let setting: SettingWrapper = setting.into();
+        let mut auth = Auth::from_setting(&setting)?;
+        auth.setting(&setting);
+        let info: Value = serde_json::from_str(&setting.read().render_information()?)?;
+        assert_eq!(info["limitation"]["restricted_writes"], json!(true));
+        let ip = "127.0.0.1".to_owned();
+        assert!(auth.verify(None, None, None, None, &ip).is_err());
+        for allowed in [&member, &extra] {
+            assert!(auth.verify(None, Some(allowed), None, None, &ip).is_ok());
+            assert!(auth.verify(None, None, Some(allowed), None, &ip).is_ok());
+        }
+        let permission = Permission {
+            event_pubkey_whitelist: Some(vec![member.clone()].into()),
+            allow_mentioning_whitelisted_pubkeys: true,
+            ..Default::default()
+        };
+        let tags = vec![vec!["p".into(), member]];
+        assert!(auth
+            .verify(
+                Some(&permission),
+                Some(&extra),
+                Some(&outsider),
+                Some(&tags),
+                &ip
+            )
+            .is_err());
+        Ok(())
+    }
 
     fn parse_text<T: serde::de::DeserializeOwned>(frame: &ws::Frame) -> Result<T> {
         if let ws::Frame::Text(text) = &frame {
@@ -299,8 +515,6 @@ mod tests {
 
     #[actix_rt::test]
     async fn nip11_reports_write_restrictions() -> Result<()> {
-        let app = web::Data::new(create_test_app("auth_nip11")?.add_extension(Auth::new()));
-        let service = init_service(create_web_app(app.clone())).await;
         let mut cases = vec![
             (json!({}), false),
             (json!({"enabled": true}), false),
@@ -326,11 +540,13 @@ mod tests {
             }
         }
         for (config, restricted) in cases {
+            let app = create_test_app("auth_nip11")?;
             app.setting
                 .write()
                 .extra
                 .insert("auth".into(), config.clone());
-            app.extensions.write().call_setting(&app.setting);
+            let app = web::Data::new(app.add_extension(Auth::new()));
+            let service = init_service(create_web_app(app)).await;
             let request = TestRequest::get()
                 .uri("/")
                 .insert_header(("Accept", "application/nostr+json"))
@@ -350,14 +566,13 @@ mod tests {
     #[test]
     fn nip11_preserves_other_write_restrictions() -> Result<()> {
         let setting: SettingWrapper = nostr_relay::Setting::default().into();
-        let mut auth = Auth::new();
         setting.write().set_restricted_writes("other", true);
         for enabled in [true, false] {
             setting.write().extra.insert(
                 "auth".into(),
                 json!({"enabled": enabled, "event": {"ip_whitelist": ["127.0.0.1"]}}),
             );
-            auth.setting(&setting);
+            Auth::new().setting(&setting);
             let info: Value = serde_json::from_str(&setting.read().render_information()?)?;
             assert_eq!(info["limitation"]["restricted_writes"], json!(true));
         }
@@ -720,7 +935,7 @@ mod tests {
             ))
             .await?;
         let notice: (String, String, bool, String) = parse_text(&framed.next().await.unwrap()?)?;
-        assert!(notice.3.contains("auth-required"));
+        assert!(notice.3.contains("restricted"));
         assert!(!notice.2);
 
         framed

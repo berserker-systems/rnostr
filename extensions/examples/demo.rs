@@ -18,7 +18,8 @@ async fn main() -> nostr_relay::Result<()> {
         app_data = app_data.add_extension(nostr_extensions::Metrics::new());
     }
 
-    app_data = app_data.add_extension(nostr_extensions::Auth::new());
+    let auth = nostr_extensions::Auth::from_setting(&app_data.setting)?;
+    app_data = app_data.add_extension(auth);
 
     #[cfg(feature = "rate_limiter")]
     {

@@ -36,11 +36,12 @@ fn run_in_system<F: std::future::Future>(future: F) -> F::Output {
 async fn run_relay(config: &PathBuf, watch: bool) -> Result<()> {
     info!("Start relay server");
 
-    let app_data = App::create(Some(config), watch, Some("RNOSTR".to_owned()), None)?;
+    let app_data = App::create(Some(config), watch, Some("RNOSTR".to_owned()), None)?
+        .add_extension(nostr_extensions::Metrics::new());
+    let auth = nostr_extensions::Auth::from_setting(&app_data.setting)?;
     let db = app_data.db.clone();
     app_data
-        .add_extension(nostr_extensions::Metrics::new())
-        .add_extension(nostr_extensions::Auth::new())
+        .add_extension(auth)
         .add_extension(nostr_extensions::Ratelimiter::new())
         .add_extension(nostr_extensions::Count::new(db))
         .add_extension(nostr_extensions::Search::new())

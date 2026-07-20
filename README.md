@@ -7,7 +7,7 @@ A high-performance and scalable [nostr](https://github.com/nostr-protocol/nostr)
 - [Most NIPs support](#nips)
 - Easy to use, no third-party service dependencies
 - High performance, Events is stored in [LMDB](https://github.com/LMDB/lmdb), Inspired by [strfry](https://github.com/hoytech/strfry)
-- Most configurations can be hot reloaded
+- Configuration reload with `--watch`; auth settings require a restart
 - Scalability, can be used as a library to [create custom relays](./relay/README.md)
 
 ### [NIPs](https://github.com/nostr-protocol/nips)
@@ -47,6 +47,15 @@ Provide metrics url for [prometheus](https://prometheus.io/) scrape
 #### Auth
 
 [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) Authentication, ip, auth pubkey and event pubkey whitelist blacklist
+
+See [allowlist sync](#allowlist-sync) for membership from a private shareholder registry.
+
+Upgrade note: unknown keys under `[auth]`, `[auth.req]` and `[auth.event]` now
+reject startup. Remove obsolete options and fix misspellings.
+
+Auth configuration requires a restart to change. Registry membership updates
+are applied separately. An empty whitelist denies everyone;
+an empty blacklist blocks nobody.
 
 #### Rate limiter
 
@@ -143,6 +152,57 @@ docker build . -t rnostr/rnostr --build-arg BASE=mirror_cn
 ```
 
 See docker compose [example](./docker-compose.yml)
+
+### Allowlist sync
+
+`allowlist-sync` fetches encrypted kind-30617 snapshots using a dedicated
+recipient key. Register its public key as `nostr.allowlist_sync_pubkey` in
+`shareholder-governance-registry`.
+
+Create a dedicated `allowlist-sync` user with primary group `rnostr-policy`,
+and add the relay user to that group. Keep the recipient nsec owned by
+`allowlist-sync`, mode 0600. The policy is mode 0640; the relay needs read access
+only. Use one writer per policy. File symlinks are rejected.
+
+Configure `/etc/rnostr/allowlist-sync.env` using the [example](./allowlist-sync.example.env).
+Private sources must authenticate the sync identity; use `--public-relay` for
+sources serving snapshots without auth.
+
+```sh
+cargo build --release -p allowlist-sync
+sudo install -Dm755 target/release/allowlist-sync /opt/rnostr/allowlist-sync
+sudo install -m644 allowlist-sync.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now allowlist-sync
+```
+
+On first installation, wait for `/var/lib/allowlist-sync/allowlist.json` to be
+created from a valid snapshot before starting the relay with registry auth:
+
+```toml
+[auth]
+enabled = true
+registry_file = "/var/lib/allowlist-sync/allowlist.json"
+```
+
+The operator, sync recipient, members and extras are allowed. Reads require
+NIP-42 auth; writes check the event author. Static restrictions also apply.
+File notifications apply policy changes immediately, independently of `--watch`,
+with a recovery poll every 60 seconds. Missed notifications may delay updates until
+that poll. Revoked readers receive no further events. Invalid files retain the last
+valid policy. Startup fails if the initial policy or watcher cannot be loaded.
+The sidecar alone enforces event version ordering.
+Changing auth configuration requires a restart; other extension settings can reload
+with `--watch`. Auth edits are retained on disk but ignored until restart; base and
+other extension changes in the same edit still apply.
+
+Each source uses one live connection, including periodic catch-up. Verified updates
+apply as they arrive. Every source must send EOSE; `--relay` also requires successful
+NIP-42 auth and a fresh request.
+Malformed member key strings are skipped with a warning; decryption and payload
+schema errors reject the snapshot. Snapshots more than 15 minutes ahead of the
+local clock are rejected. EOSE does not prove the source has the latest snapshot.
+Extras can change offline at startup without resetting the registry version.
 
 ### Commands
 

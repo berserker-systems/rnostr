@@ -45,7 +45,16 @@ fn main() -> anyhow::Result<()> {
             bench_opts(opts)?;
         }
         Commands::Relay(opts) => {
-            tracing_subscriber::fmt::try_init().map_err(anyhow::Error::msg)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::builder()
+                        .with_default_directive(
+                            tracing_subscriber::filter::LevelFilter::INFO.into(),
+                        )
+                        .from_env_lossy(),
+                )
+                .try_init()
+                .map_err(anyhow::Error::msg)?;
             relay(&opts.config, opts.watch)?;
         }
         Commands::Delete(opts) => {

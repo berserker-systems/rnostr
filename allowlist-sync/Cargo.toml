@@ -1,0 +1,29 @@
+[package]
+name = "allowlist-sync"
+version = "0.4.9"
+description = "Publish an rnostr authorization policy from an encrypted shareholder registry event."
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+allowlist-policy = { version = "0.4.9", path = "../allowlist-policy" }
+anyhow = "1.0.86"
+clap = { version = "4.5.16", features = ["derive", "env"] }
+nostr-sdk = { version = "0.44", default-features = false, features = ["nip44"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde_json = "1.0.127"
+tempfile = "3.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+futures-util = { version = "0.3", features = ["sink"] }
+tokio = { version = "1", features = ["net", "process"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }

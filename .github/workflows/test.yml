@@ -32,6 +32,7 @@ jobs:
             -p nostr-relay,
             -p nostr-extensions,
             -p rnostr,
+            -p allowlist-sync,
           ]
     steps:
       - uses: actions/checkout@v3
@@ -52,6 +53,22 @@ jobs:
         with:
           toolchain: stable
       - run: cargo test ${{ matrix.args }}
+      - name: Test shared authorization policy format
+        if: matrix.args == '-p allowlist-sync'
+        run: cargo test -p allowlist-policy
+      - name: Test allowlist sync against local WebSocket relays
+        if: matrix.args == '-p allowlist-sync'
+        run: cargo test -p allowlist-sync --test fetch -- --ignored
+      - name: Test real shutdown signals in isolation
+        if: matrix.args == '-p allowlist-sync' && runner.os != 'Windows'
+        run: cargo test -p allowlist-sync --bin allowlist-sync tests::unix_shutdown_signals_are_registered_before_polling -- --ignored --exact
+      - name: Test service publication and key isolation
+        if: matrix.args == '-p allowlist-sync' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          probe=$(cargo test -p allowlist-sync --bin allowlist-sync --no-run --message-format=json |
+            python3 -c 'import json,sys; print(next(m["executable"] for line in sys.stdin if (m := json.loads(line)).get("reason") == "compiler-artifact" and m.get("profile", {}).get("test") and m.get("executable")))')
+          sudo bash .github/scripts/allowlist-service-smoke.sh "$probe"
 
   docker:
     runs-on: ubuntu-latest

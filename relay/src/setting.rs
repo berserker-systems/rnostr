@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     any::{Any, TypeId},
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     ops::Deref,
     panic::{self, AssertUnwindSafe},
@@ -189,6 +189,9 @@ pub struct Setting {
 
     #[serde(skip)]
     write_restrictions: HashSet<&'static str>,
+
+    #[serde(skip)]
+    frozen_extensions: BTreeSet<String>,
 }
 
 impl PartialEq for Setting {
@@ -227,7 +230,7 @@ impl From<Setting> for SettingWrapper {
 impl SettingWrapper {
     /// Reload settings from file, with optional environment overrides.
     pub fn reload<P: AsRef<Path>>(&self, file: P, env_prefix: Option<String>) -> Result<()> {
-        *self.write() = Setting::read(file, env_prefix)?;
+        self.apply_setting(Setting::read(file, env_prefix)?);
         Ok(())
     }
 
@@ -240,9 +243,30 @@ impl SettingWrapper {
             warn!(file = %file.display(), "skipping reload: no settings in file");
             return Ok(false);
         }
-        let setting = Setting::from_config(config, env_prefix)?;
-        *self.write() = setting;
+        self.apply_setting(Setting::from_config(config, env_prefix)?);
         Ok(true)
+    }
+
+    fn apply_setting(&self, mut setting: Setting) {
+        let mut current = self.write();
+        for key in &current.frozen_extensions {
+            if setting.extra.get(key) != current.extra.get(key) {
+                warn!(
+                    extension = key,
+                    "settings change requires a restart; keeping current extension settings"
+                );
+                match current.extra.get(key) {
+                    Some(value) => {
+                        setting.extra.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        setting.extra.remove(key);
+                    }
+                }
+            }
+        }
+        setting.frozen_extensions = std::mem::take(&mut current.frozen_extensions);
+        *current = setting;
     }
 
     /// config from file and watch file update then reload
@@ -342,6 +366,11 @@ fn config_changed(event: &Event, file: &Path) -> bool {
 }
 
 impl Setting {
+    /// Keep this extension's startup configuration during file reloads.
+    pub fn freeze_extension(&mut self, key: &str) {
+        self.frozen_extensions.insert(key.to_owned());
+    }
+
     /// add supported nips for nip-11 information
     pub fn add_nip(&mut self, nip: u32) {
         if !self.information.supported_nips.contains(&nip) {
@@ -374,16 +403,18 @@ impl Setting {
 
     /// Parse extension setting.
     pub fn parse_extension<T: DeserializeOwned + Default>(&self, key: &str) -> T {
-        self.extra
-            .get(key)
-            .and_then(|v| {
-                let r = serde_json::from_value::<T>(v.clone());
-                if let Err(err) = &r {
-                    error!(error = err.to_string(), "failed to parse {:?} setting", key);
-                }
-                r.ok()
-            })
-            .unwrap_or_default()
+        self.try_parse_extension(key).unwrap_or_else(|err| {
+            error!(error = %err, "failed to parse extension settings");
+            T::default()
+        })
+    }
+
+    pub fn try_parse_extension<T: DeserializeOwned + Default>(&self, key: &str) -> Result<T> {
+        match self.extra.get(key) {
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|err| Error::Message(format!("invalid {key} settings: {err}"))),
+            None => Ok(T::default()),
+        }
     }
 
     /// save extension setting

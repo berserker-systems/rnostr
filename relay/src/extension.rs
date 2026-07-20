@@ -40,6 +40,17 @@ pub trait Extension: Send + Sync {
     #[allow(unused_variables)]
     fn disconnected(&self, session: &mut Session, ctx: &mut <Session as actix::Actor>::Context) {}
 
+    /// Return false to suppress delivery of a server message.
+    #[allow(unused_variables)]
+    fn outgoing(
+        &self,
+        msg: &OutgoingMessage,
+        session: &mut Session,
+        ctx: &mut <Session as actix::Actor>::Context,
+    ) -> bool {
+        true
+    }
+
     /// Execute when message incoming
     #[allow(unused_variables)]
     fn message(
@@ -93,6 +104,15 @@ impl Extensions {
         for ext in &self.list {
             ext.disconnected(session, ctx);
         }
+    }
+
+    pub fn call_outgoing(
+        &self,
+        msg: &OutgoingMessage,
+        session: &mut Session,
+        ctx: &mut <Session as actix::Actor>::Context,
+    ) -> bool {
+        self.list.iter().all(|ext| ext.outgoing(msg, session, ctx))
     }
 
     pub fn call_message(
