@@ -1,0 +1,27 @@
+[package]
+name = "allowlist-sync"
+version = "0.4.9"
+description = "Sync an rnostr [auth] pubkey allowlist from a NIP-34 (kind 30617) repo announcement."
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "allowlist-sync"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.86"
+clap = { version = "4.5.16", features = ["derive", "env"] }
+nostr-sdk = "0.44"
+tempfile = "3.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+toml_edit = "0.22"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+xattr = "1"
