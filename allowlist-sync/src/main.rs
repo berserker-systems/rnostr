@@ -3,15 +3,17 @@
 //! Keeps an rnostr `[auth]` pubkey allowlist in sync with a NIP-34 git
 //! repository announcement (kind 30617) published by a trusted authority.
 //!
-//! The allowed set is `{event author} ∪ {pubkeys in the `maintainers` tag}`.
-//! That set is written into both `[auth.req].pubkey_whitelist` (read, NIP-42)
-//! and `[auth.event].event_pubkey_whitelist` (write, by author) of the rnostr
-//! config file, and `allow_mentioning_whitelisted_pubkeys` is forced off
-//! because it would waive that write check. rnostr is expected to run with
-//! `--watch` so the edits apply live without a restart. The winning event
-//! version and allowlist are stored beside the config in
+//! The announced set is `{event author} ∪ {pubkeys in the `maintainers` tag}`.
+//! Locally configured `--extra-pubkey` operators are unioned on top of it at
+//! write time. The result is written into both `[auth.req].pubkey_whitelist`
+//! (read, NIP-42) and `[auth.event].event_pubkey_whitelist` (write, by author)
+//! of the rnostr config file, and `allow_mentioning_whitelisted_pubkeys` is
+//! forced off because it would waive that write check. rnostr is expected to
+//! run with `--watch` so the edits apply live without a restart. The winning
+//! event version and the *announced* allowlist are stored beside the config in
 //! `<config-name>.allowlist-sync-state` for rollback and offline drift
-//! protection.
+//! protection; extras stay out of that file so changing them takes effect on
+//! the next write, even while offline.
 
 use std::{
     cmp::Ordering,
@@ -57,6 +59,15 @@ struct Cli {
     )]
     relays: Vec<String>,
 
+    /// Extra pubkey(s) to always allow, in addition to the announced set
+    /// (repeatable). Accepts npub or 64-char hex.
+    #[arg(
+        long = "extra-pubkey",
+        env = "ALLOWLIST_EXTRA_PUBKEYS",
+        value_delimiter = ','
+    )]
+    extra_pubkeys: Vec<String>,
+
     /// Path to the rnostr.toml to update.
     #[arg(long, env = "ALLOWLIST_CONFIG", default_value = "./config/rnostr.toml")]
     config: PathBuf,
@@ -101,7 +112,13 @@ async fn main() -> Result<()> {
 
     let authority = PublicKey::parse(&cli.authority)
         .with_context(|| format!("invalid authority pubkey: {}", cli.authority))?;
-    info!(authority = %authority.to_hex(), identifier = %cli.identifier, "starting allowlist-sync");
+    let extras = parse_extra_pubkeys(&cli.extra_pubkeys)?;
+    info!(
+        authority = %authority.to_hex(),
+        identifier = %cli.identifier,
+        extras = extras.len(),
+        "starting allowlist-sync"
+    );
 
     // Ephemeral signer so the client can answer NIP-42 challenges from source
     // relays that require auth (best effort; prefer an independent relay).
@@ -147,6 +164,7 @@ async fn main() -> Result<()> {
         &filter,
         cli.fetch_timeout,
         &cli.config,
+        &extras,
         &version_store,
         &mut last_applied,
     )
@@ -188,6 +206,7 @@ async fn main() -> Result<()> {
                     &filter,
                     cli.fetch_timeout,
                     &cli.config,
+                    &extras,
                     &version_store,
                     &mut last_applied,
                 ).await {
@@ -205,6 +224,7 @@ async fn main() -> Result<()> {
                             &event,
                             &filter,
                             &cli.config,
+                            &extras,
                             &version_store,
                             &mut last_applied,
                         ) {
@@ -220,6 +240,7 @@ async fn main() -> Result<()> {
                             &filter,
                             cli.fetch_timeout,
                             &cli.config,
+                            &extras,
                             &version_store,
                             &mut last_applied,
                         ).await {
@@ -425,10 +446,11 @@ async fn sync_latest(
     filter: &Filter,
     timeout: Duration,
     config: &Path,
+    extras: &[String],
     version_store: &EventVersionStore,
     last_applied: &mut Option<AppliedEvent>,
 ) -> Result<bool> {
-    reconcile_config(config, last_applied.as_ref())?;
+    reconcile_config(config, extras, last_applied.as_ref())?;
 
     let events = client
         .fetch_events(filter.clone(), timeout)
@@ -437,20 +459,25 @@ async fn sync_latest(
     let Some(event) = latest_event(events) else {
         return Ok(false);
     };
-    process_event(&event, filter, config, version_store, last_applied)?;
+    process_event(&event, filter, config, extras, version_store, last_applied)?;
     Ok(true)
 }
 
-fn reconcile_config(config: &Path, current: Option<&AppliedEvent>) -> Result<()> {
+fn reconcile_config(
+    config: &Path,
+    extras: &[String],
+    current: Option<&AppliedEvent>,
+) -> Result<()> {
     let Some(current) = current else {
         return Ok(());
     };
 
-    if apply_to_config(config, &current.allowed)
+    let effective = union_allowed(&current.allowed, extras);
+    if apply_to_config(config, &effective)
         .with_context(|| format!("failed to reconcile {}", config.display()))?
     {
         info!(
-            count = current.allowed.len(),
+            count = effective.len(),
             "restored persisted allowlist in {}",
             config.display()
         );
@@ -478,6 +505,7 @@ fn process_event(
     event: &Event,
     filter: &Filter,
     config: &Path,
+    extras: &[String],
     version_store: &EventVersionStore,
     last_applied: &mut Option<AppliedEvent>,
 ) -> Result<()> {
@@ -518,21 +546,52 @@ fn process_event(
         *last_applied = Some(state.clone());
     }
 
-    let changed = apply_to_config(config, &state.allowed)
+    let effective = union_allowed(&state.allowed, extras);
+    let changed = apply_to_config(config, &effective)
         .with_context(|| format!("failed to update {}", config.display()))?;
     if changed {
         info!(
-            count = state.allowed.len(),
+            count = effective.len(),
             "updated allowlist in {}",
             config.display()
         );
     } else {
         info!(
-            count = state.allowed.len(),
+            count = effective.len(),
             "allowlist already up to date; no write"
         );
     }
     Ok(())
+}
+
+/// Parse and normalize the locally configured always-allowed operator pubkeys.
+fn parse_extra_pubkeys(raw: &[String]) -> Result<Vec<String>> {
+    let mut set = std::collections::BTreeSet::new();
+    for candidate in raw {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let pubkey = PublicKey::parse(trimmed)
+            .with_context(|| format!("invalid extra pubkey: {trimmed}"))?;
+        set.insert(pubkey.to_hex());
+    }
+    Ok(set.into_iter().collect())
+}
+
+/// Overlay the locally configured extras on top of the announced set. Extras
+/// are applied at write time only, so they are never persisted as if the
+/// authority had announced them.
+fn union_allowed(announced: &[String], extras: &[String]) -> Vec<String> {
+    if extras.is_empty() {
+        return announced.to_vec();
+    }
+    let set: std::collections::BTreeSet<&str> = announced
+        .iter()
+        .chain(extras.iter())
+        .map(String::as_str)
+        .collect();
+    set.into_iter().map(str::to_owned).collect()
 }
 
 /// Allowed set = author pubkey ∪ maintainers tag pubkeys, as sorted, deduped hex.
@@ -727,6 +786,8 @@ mod tests {
 
     const PK_A: &str = "0000000000000000000000000000000000000000000000000000000000000001";
     const PK_B: &str = "0000000000000000000000000000000000000000000000000000000000000002";
+    const PK_C: &str = "0000000000000000000000000000000000000000000000000000000000000003";
+    const NO_EXTRAS: &[String] = &[];
 
     fn write_tmp(name: &str, content: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("allowlist-sync-tests");
@@ -1024,6 +1085,7 @@ event_pubkey_whitelist = []
             &event,
             &filter,
             Path::new("unused-for-rejected-events"),
+            NO_EXTRAS,
             &store,
             &mut last_applied,
         )
@@ -1053,7 +1115,9 @@ event_pubkey_whitelist = []
         let store = version_store(&path, &keys, "repo");
         let mut last_applied = None;
 
-        assert!(process_event(&event, &filter, &path, &store, &mut last_applied).is_err());
+        assert!(
+            process_event(&event, &filter, &path, NO_EXTRAS, &store, &mut last_applied).is_err()
+        );
         assert_eq!(
             last_applied.as_ref().map(|state| state.version.clone()),
             Some(EventVersion::new(&event))
@@ -1062,7 +1126,7 @@ event_pubkey_whitelist = []
 
         std::fs::write(&path, "[auth]\nenabled = false\n").unwrap();
         let after_restart = store.load().unwrap();
-        reconcile_config(&path, after_restart.as_ref()).unwrap();
+        reconcile_config(&path, NO_EXTRAS, after_restart.as_ref()).unwrap();
 
         let doc: DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(doc["auth"]["enabled"].as_bool(), Some(true));
@@ -1077,10 +1141,10 @@ event_pubkey_whitelist = []
         let store = version_store(&path, &keys, "repo");
         let mut last_applied = None;
 
-        process_event(&event, &filter, &path, &store, &mut last_applied).unwrap();
+        process_event(&event, &filter, &path, NO_EXTRAS, &store, &mut last_applied).unwrap();
         std::fs::write(&path, "[auth]\nenabled = false\n").unwrap();
 
-        process_event(&event, &filter, &path, &store, &mut last_applied).unwrap();
+        process_event(&event, &filter, &path, NO_EXTRAS, &store, &mut last_applied).unwrap();
 
         let doc: DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(doc["auth"]["enabled"].as_bool(), Some(true));
@@ -1098,10 +1162,26 @@ event_pubkey_whitelist = []
         let store = version_store(&path, &keys, "repo");
         let mut last_applied = None;
 
-        process_event(&current, &filter, &path, &store, &mut last_applied).unwrap();
+        process_event(
+            &current,
+            &filter,
+            &path,
+            NO_EXTRAS,
+            &store,
+            &mut last_applied,
+        )
+        .unwrap();
 
         let mut after_restart = store.load().unwrap();
-        process_event(&stale, &filter, &path, &store, &mut after_restart).unwrap();
+        process_event(
+            &stale,
+            &filter,
+            &path,
+            NO_EXTRAS,
+            &store,
+            &mut after_restart,
+        )
+        .unwrap();
 
         assert_eq!(
             after_restart.as_ref().map(|state| state.version.clone()),
@@ -1111,6 +1191,136 @@ event_pubkey_whitelist = []
         let req = doc["auth"]["req"]["pubkey_whitelist"].as_array().unwrap();
         assert!(req.iter().any(|value| value.as_str() == Some(PK_B)));
         assert!(!req.iter().any(|value| value.as_str() == Some(PK_A)));
+    }
+
+    #[test]
+    fn extra_pubkeys_are_normalized_deduped_and_validated() {
+        let keys = Keys::generate();
+        let npub = keys.public_key().to_bech32().unwrap();
+
+        let parsed = parse_extra_pubkeys(&[
+            PK_B.to_owned(),
+            npub,
+            PK_B.to_owned(),
+            "  ".to_owned(),
+            PK_A.to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![PK_A.to_owned(), PK_B.to_owned(), keys.public_key().to_hex()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+
+        let err = parse_extra_pubkeys(&["not-a-pubkey".to_owned()]).unwrap_err();
+        assert!(err.to_string().contains("invalid extra pubkey"));
+    }
+
+    #[test]
+    fn extras_are_written_to_config_but_not_persisted_as_announced() {
+        let keys = Keys::generate();
+        let filter = announcement_filter(&keys, "repo");
+        let event = announcement_with_maintainers(&keys, "repo", Timestamp::from(10), &[PK_A]);
+        let path = write_tmp("extras.toml", "[auth]\nenabled = false\n");
+        let store = version_store(&path, &keys, "repo");
+        let extras = vec![PK_C.to_owned()];
+        let mut last_applied = None;
+
+        process_event(&event, &filter, &path, &extras, &store, &mut last_applied).unwrap();
+
+        let doc: DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        for whitelist in [
+            &doc["auth"]["req"]["pubkey_whitelist"],
+            &doc["auth"]["event"]["event_pubkey_whitelist"],
+        ] {
+            let got: Vec<_> = whitelist
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned())
+                .collect();
+            assert!(got.contains(&PK_A.to_owned()));
+            assert!(got.contains(&keys.public_key().to_hex()));
+            assert!(got.contains(&PK_C.to_owned()));
+        }
+
+        // The state file records only what the authority announced.
+        let persisted = store.load().unwrap().unwrap();
+        assert!(!persisted.allowed.contains(&PK_C.to_owned()));
+        assert_eq!(last_applied.unwrap().allowed, persisted.allowed);
+    }
+
+    #[test]
+    fn changed_extras_apply_offline_from_persisted_state() {
+        let keys = Keys::generate();
+        let filter = announcement_filter(&keys, "repo");
+        let event = announcement_with_maintainers(&keys, "repo", Timestamp::from(10), &[PK_A]);
+        let path = write_tmp("extras-offline.toml", "[auth]\nenabled = false\n");
+        let store = version_store(&path, &keys, "repo");
+        let mut last_applied = None;
+
+        process_event(&event, &filter, &path, NO_EXTRAS, &store, &mut last_applied).unwrap();
+
+        // Restart with a new extra key and no relay reachable: reconciling the
+        // persisted announcement must still pick the new extra up.
+        let after_restart = store.load().unwrap();
+        reconcile_config(&path, &[PK_C.to_owned()], after_restart.as_ref()).unwrap();
+
+        let doc: DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        let req = doc["auth"]["req"]["pubkey_whitelist"].as_array().unwrap();
+        assert!(req.iter().any(|value| value.as_str() == Some(PK_C)));
+        assert!(req.iter().any(|value| value.as_str() == Some(PK_A)));
+    }
+
+    #[test]
+    fn removed_extras_are_dropped_on_the_next_write() {
+        let keys = Keys::generate();
+        let filter = announcement_filter(&keys, "repo");
+        let event = announcement_with_maintainers(&keys, "repo", Timestamp::from(10), &[PK_A]);
+        let path = write_tmp("extras-removed.toml", "[auth]\nenabled = false\n");
+        let store = version_store(&path, &keys, "repo");
+        let mut last_applied = None;
+
+        let extras = vec![PK_C.to_owned()];
+        process_event(&event, &filter, &path, &extras, &store, &mut last_applied).unwrap();
+        // Same event, extras dropped from the command line.
+        process_event(&event, &filter, &path, NO_EXTRAS, &store, &mut last_applied).unwrap();
+
+        let doc: DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        let req = doc["auth"]["req"]["pubkey_whitelist"].as_array().unwrap();
+        assert!(!req.iter().any(|value| value.as_str() == Some(PK_C)));
+        assert!(req.iter().any(|value| value.as_str() == Some(PK_A)));
+    }
+
+    #[test]
+    fn extras_survive_a_superseding_announcement() {
+        let keys = Keys::generate();
+        let filter = announcement_filter(&keys, "repo");
+        let first = announcement_with_maintainers(&keys, "repo", Timestamp::from(10), &[PK_A]);
+        let second = announcement_with_maintainers(&keys, "repo", Timestamp::from(20), &[PK_B]);
+        let path = write_tmp("extras-superseded.toml", "[auth]\nenabled = false\n");
+        let store = version_store(&path, &keys, "repo");
+        let extras = vec![PK_C.to_owned()];
+        let mut last_applied = None;
+
+        process_event(&first, &filter, &path, &extras, &store, &mut last_applied).unwrap();
+        process_event(&second, &filter, &path, &extras, &store, &mut last_applied).unwrap();
+
+        let doc: DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        let req = doc["auth"]["req"]["pubkey_whitelist"].as_array().unwrap();
+        // The newer announcement replaces the maintainer it dropped, but the
+        // locally configured extra is not the authority's to revoke.
+        assert!(req.iter().any(|value| value.as_str() == Some(PK_B)));
+        assert!(!req.iter().any(|value| value.as_str() == Some(PK_A)));
+        assert!(req.iter().any(|value| value.as_str() == Some(PK_C)));
+
+        // Still absent from the state file, which tracks only the announcement.
+        let persisted = store.load().unwrap().unwrap();
+        assert_eq!(persisted.version, EventVersion::new(&second));
+        assert!(!persisted.allowed.contains(&PK_C.to_owned()));
     }
 
     #[test]
