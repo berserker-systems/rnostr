@@ -56,6 +56,13 @@ impl Session {
             .and_then(|boxed| boxed.downcast_ref())
     }
 
+    /// get extension data for in-place mutation
+    pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        self.data
+            .get_mut(&TypeId::of::<T>())
+            .and_then(|boxed| boxed.downcast_mut())
+    }
+
     /// Get session id
     pub fn id(&self) -> usize {
         self.id

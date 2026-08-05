@@ -25,13 +25,16 @@ actix-web = "4.9.0"
 parking_lot = "0.12.3"
 tracing = "0.1.40"
 governor = { version = "0.6.3", optional = true }
+negentropy = { version = "0.5", optional = true }
+hex = { version = "0.4", optional = true }
 
 [features]
-default = ["metrics", "rate_limiter", "count", "search"]
+default = ["metrics", "rate_limiter", "count", "search", "negentropy"]
 search = ["nostr-relay/search"]
 metrics = ["metrics-exporter-prometheus", "metrics-util"]
 rate_limiter = ["governor"]
 count = []
+negentropy = ["dep:negentropy", "dep:hex"]
 
 [dev-dependencies]
 actix-rt = "2.10.0"

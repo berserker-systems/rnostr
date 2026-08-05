@@ -245,6 +245,33 @@ impl Extension for Auth {
                         return OutgoingMessage::closed(&sub.id, &msg).into();
                     }
                 }
+                // NIP-77 reconciliation reads events by filter, so it needs the
+                // same permission as REQ. It arrives as an unknown command, so
+                // without this arm it would fall through the match ungated.
+                IncomingMessage::Unknown(command, values) if command == "NEG-OPEN" => {
+                    if let Err(err) = Self::verify_permission(
+                        self.setting.req.as_ref(),
+                        state.and_then(|s| s.pubkey()),
+                        None,
+                        None,
+                        session.ip(),
+                    ) {
+                        counter!("nostr_relay_auth_unauthorized", "command" => "NEG-OPEN", "reason" => err).increment(1);
+                        let sub_id = values
+                            .first()
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default();
+                        return OutgoingMessage(
+                            serde_json::json!([
+                                "NEG-ERR",
+                                sub_id,
+                                format!("auth-required: {}", err)
+                            ])
+                            .to_string(),
+                        )
+                        .into();
+                    }
+                }
                 _ => {}
             }
         }
@@ -756,6 +783,77 @@ mod tests {
             .await?;
         let item = framed.next().await.unwrap()?;
         assert_eq!(item, ws::Frame::Close(Some(ws::CloseCode::Normal.into())));
+
+        Ok(())
+    }
+
+    /// NIP-77 reconciliation reads events by filter, so an unauthenticated
+    /// NEG-OPEN must be refused exactly like an unauthenticated REQ. It arrives
+    /// as an unknown command, which is easy to let through by accident.
+    #[actix_rt::test]
+    async fn neg_open_requires_the_req_permission() -> Result<()> {
+        let mut rng = thread_rng();
+        let key_pair = Keypair::new_global(&mut rng);
+        let pubkey = XOnlyPublicKey::from_keypair(&key_pair).0;
+
+        let app = create_test_app("auth-neg-open")?;
+        {
+            let mut w = app.setting.write();
+            w.extra = serde_json::from_str(&format!(
+                r#"{{
+                "auth": {{
+                    "enabled": true,
+                    "req": {{
+                        "pubkey_whitelist": ["{}"]
+                    }}
+                }}
+            }}"#,
+                pubkey
+            ))?;
+        }
+        let app = app.add_extension(Auth::new());
+        let app = web::Data::new(app);
+
+        let mut srv = actix_test::start(move || create_web_app(app.clone()));
+        let mut framed = srv.ws_at("/").await.unwrap();
+
+        let state: (String, String) = parse_text(&framed.next().await.unwrap()?)?;
+        assert_eq!(state.0, "AUTH");
+
+        // Before authenticating: refused, and reported on the NIP-77 channel so
+        // the client is not left waiting for a NEG-MSG that never comes.
+        framed
+            .send(ws::Message::Text(
+                r#"["NEG-OPEN", "sync", {}, "61"]"#.into(),
+            ))
+            .await?;
+        let res: (String, String, String) = parse_text(&framed.next().await.unwrap()?)?;
+        assert_eq!(res.0, "NEG-ERR");
+        assert_eq!(res.1, "sync");
+        assert!(res.2.contains("auth-required"), "got {}", res.2);
+
+        // After authenticating as a whitelisted pubkey the auth extension lets
+        // it through; with no negentropy extension registered the core answers.
+        let event = Event::create(
+            &key_pair,
+            now(),
+            22242,
+            vec![vec!["challenge".to_owned(), state.1.clone()]],
+            "".to_owned(),
+        )?;
+        framed
+            .send(ws::Message::Text(format!(r#"["AUTH", {}]"#, event).into()))
+            .await?;
+        let ok: (String, String, bool, String) = parse_text(&framed.next().await.unwrap()?)?;
+        assert!(ok.2);
+
+        framed
+            .send(ws::Message::Text(
+                r#"["NEG-OPEN", "sync", {}, "61"]"#.into(),
+            ))
+            .await?;
+        let res: (String, String) = parse_text(&framed.next().await.unwrap()?)?;
+        assert_eq!(res, ("NOTICE".to_owned(), "Unsupported message".to_owned()));
 
         Ok(())
     }

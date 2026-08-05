@@ -41,7 +41,8 @@ pub async fn relay(config: &PathBuf, watch: bool) -> Result<()> {
         .add_extension(nostr_extensions::Metrics::new())
         .add_extension(nostr_extensions::Auth::new())
         .add_extension(nostr_extensions::Ratelimiter::new())
-        .add_extension(nostr_extensions::Count::new(db))
+        .add_extension(nostr_extensions::Count::new(db.clone()))
+        .add_extension(nostr_extensions::Negentropies::new(db))
         .add_extension(nostr_extensions::Search::new())
         .web_server()?
         .await?;

@@ -32,6 +32,7 @@ A high-performance and scalable [nostr](https://github.com/nostr-protocol/nostr)
 - [x] NIP-45: Counting results. [experimental](#count)
 - [x] NIP-50: Keywords filter. [experimental](#search)
 - [x] NIP-70: Protected Events
+- [x] NIP-77: Negentropy syncing. [experimental](#negentropy)
 
 ### Extensions
 
@@ -67,6 +68,38 @@ When the query results are too large (millions) will trigger a slow query. `sett
 It reduces write concurrency and makes space usage significantly larger. So it is suitable for use in private or paid relay.
 
 Now we only index the content of `kind: 1` note event.
+
+#### Negentropy
+
+[NIP-77](https://nips.be/77) set reconciliation, letting a client and the relay
+work out which events each side is missing without transferring them all.
+
+`NEG-OPEN` snapshots the `(created_at, id)` pairs matching its filter, so the
+cost of a reconciliation is set by how many events the filter matches, not by
+their size. The snapshot is taken once when the reconciliation opens and is not
+updated by events written afterwards; open a new one to pick those up.
+
+`NEG-OPEN` is a filter query like `REQ`, so it obeys the same `[auth.req]`
+permission — on an authenticated relay a client must complete NIP-42 before it
+can reconcile.
+
+Because the whole matched set is held in memory for the duration of a
+reconciliation (roughly 40 bytes per event), `max_records` caps how large a set
+one `NEG-OPEN` may cover; a filter matching more is refused with `blocked:`
+rather than reconciled against a truncated set. `max_sessions` caps how many
+reconciliations one connection may keep open, and `idle_timeout` drops those
+that go quiet — including on a connection that has stopped sending anything at
+all, which is the case that actually pins memory.
+
+Those two only bound a single connection, so their product is what one client
+can hold: 8 MiB at the defaults. `max_total_records` bounds the relay instead,
+across every connection, and refuses a `NEG-OPEN` that would exceed it.
+
+`frame_size_limit` bounds the size of a single response, which `max_records`
+does not: a client whose set is empty opens with a 5 byte message that asks for
+every matching id, so with splitting disabled the relay would answer in one
+frame of roughly 64 bytes of hex per event. The default splits responses across
+rounds instead; lowering it costs extra round trips.
 
 ## Usage
 
