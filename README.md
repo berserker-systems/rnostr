@@ -166,14 +166,19 @@ in `rnostr.toml` in sync with the private kind-30617 snapshots published by
 `shareholder-governance-registry`. It authenticates as the registry operator,
 fetches the self-addressed event, decrypts its NIP-44 v2 content, and parses the
 JSON array of shareholder npubs. The effective allowlist is the registry
-operator plus those shareholders and any local `--extra-pubkey` keys. It
-rewrites the config atomically, so run the relay with `--watch` to pick up
-changes without a restart.
+operator, the dedicated sync recipient, those shareholders, and any local
+`--extra-pubkey` keys. It rewrites the config atomically, so run the relay with
+`--watch` to pick up changes without a restart.
 
-The recipient nsec file must contain the registry operator's nsec. The registry
-always publishes a self-copy to that identity, so updates continue even when
-the shareholder set becomes empty. Keep the file readable only by the sidecar
-service account.
+The recipient nsec file contains a dedicated allowlist-sync identity. Configure
+its public key as `nostr.allowlist_sync_pubkey` in
+`shareholder-governance-registry`; the registry then publishes a copy to it on
+every update, even when the shareholder set becomes empty. Keep the nsec file
+readable only by the sidecar service account.
+
+For initial bootstrap, pre-allow the sync public key on the managed relay or
+fetch from an independent relay. After the first successful sync, the sidecar
+keeps its own public key in both managed whitelists.
 
 ```shell
 
@@ -183,7 +188,7 @@ cargo build --release
 # One-shot: fetch, decrypt, apply, and exit. Exits non-zero if no snapshot is found.
 ./target/release/allowlist-sync \
     --authority npub1_registry_operator... \
-    --recipient-nsec-file /etc/rnostr/registry-operator.nsec \
+    --recipient-nsec-file /etc/rnostr/allowlist-sync.nsec \
     --relay wss://relay.example.com \
     --config ./config/rnostr.toml \
     --once

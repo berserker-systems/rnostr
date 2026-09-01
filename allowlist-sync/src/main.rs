@@ -6,8 +6,9 @@
 //! The event is selected by its trusted author, configured kind, and recipient
 //! pubkey in its `d` and `p` tags. Its NIP-44 v2 content is decrypted with the
 //! recipient key and decoded as a JSON array of npubs. The effective allowlist
-//! is `{event author} and {decrypted shareholders} and {local extras}`. The
-//! author is retained so it can keep publishing updates to the managed relay.
+//! is `{event author} + {sync recipient} + {decrypted shareholders} +
+//! {local extras}`. The infrastructure identities are retained so publishing,
+//! fetching, and decryption keep working as shareholder membership changes.
 //! The result is written into both `[auth.req].pubkey_whitelist` (read, NIP-42)
 //! and `[auth.event].event_pubkey_whitelist` (write, by author). The winning
 //! event version and decrypted allowlist are stored beside the config for
@@ -44,7 +45,7 @@ struct Cli {
     #[arg(long, env = "ALLOWLIST_AUTHORITY")]
     authority: String,
 
-    /// File containing the stable recipient nsec used to decrypt the registry.
+    /// File containing the dedicated sync recipient nsec.
     #[arg(long, env = "ALLOWLIST_RECIPIENT_NSEC_FILE")]
     recipient_nsec_file: PathBuf,
 
@@ -137,14 +138,6 @@ async fn main() -> Result<()> {
         .with_context(|| format!("invalid authority pubkey: {}", cli.authority))?;
     let recipient_keys = read_recipient_keys(&cli.recipient_nsec_file)?;
     let recipient = recipient_keys.public_key();
-    if recipient != authority {
-        anyhow::bail!(
-            "recipient nsec {} does not belong to registry authority {}; \
-             the registry's always-published self-copy requires the authority nsec",
-            cli.recipient_nsec_file.display(),
-            authority.to_hex()
-        );
-    }
     let kind = Kind::from(cli.event_kind);
     if !kind.is_addressable() {
         anyhow::bail!(
@@ -679,9 +672,9 @@ fn union_allowed(registry: &[String], extras: &[String]) -> Vec<String> {
     set.into_iter().map(str::to_owned).collect()
 }
 
-/// Decrypt the registry snapshot and return author and shareholders as sorted,
-/// deduplicated hex pubkeys. The author stays allowed so it can publish the
-/// next snapshot to the managed relay even when it owns no shares itself.
+/// Decrypt the registry snapshot and return author + sync recipient +
+/// shareholders as sorted, deduplicated hex pubkeys. Both infrastructure
+/// identities stay allowed as shareholder membership changes.
 fn decrypt_allowed(event: &Event, recipient_keys: &Keys) -> Result<Vec<String>> {
     let plaintext = nip44::decrypt(recipient_keys.secret_key(), &event.pubkey, &event.content)
         .with_context(|| format!("cannot decrypt registry event {}", event.id))?;
@@ -690,6 +683,7 @@ fn decrypt_allowed(event: &Event, recipient_keys: &Keys) -> Result<Vec<String>> 
 
     let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     set.insert(event.pubkey.to_hex());
+    set.insert(recipient_keys.public_key().to_hex());
     for raw in shareholders {
         let pubkey = PublicKey::parse(&raw).with_context(|| {
             format!(
@@ -1137,6 +1131,7 @@ event_pubkey_whitelist = []
         let allowed = decrypt_allowed(&event, &recipient_keys()).unwrap();
         let author_hex = authority.public_key().to_hex();
         assert!(allowed.contains(&author_hex));
+        assert!(allowed.contains(&recipient_keys().public_key().to_hex()));
         assert!(allowed.contains(&PK_A.to_string()));
         assert!(allowed.contains(&PK_B.to_string()));
         // Sorted + deduped.
@@ -1147,12 +1142,20 @@ event_pubkey_whitelist = []
     }
 
     #[test]
-    fn decrypt_allowed_keeps_author_for_an_empty_registry() {
+    fn decrypt_allowed_keeps_infrastructure_keys_for_an_empty_registry() {
         let authority = Keys::generate();
         let event = registry_snapshot(&authority, Timestamp::from(10), &[]);
+        let expected: Vec<_> = [
+            authority.public_key().to_hex(),
+            recipient_keys().public_key().to_hex(),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
         assert_eq!(
             decrypt_allowed(&event, &recipient_keys()).unwrap(),
-            vec![authority.public_key().to_hex()]
+            expected
         );
     }
 
