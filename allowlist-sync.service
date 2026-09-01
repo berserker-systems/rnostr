@@ -1,5 +1,5 @@
 [Unit]
-Description=Sync rnostr auth allowlist from a NIP-34 repo announcement
+Description=Sync rnostr auth allowlist from the private shareholder registry
 After=network-online.target
 Wants=network-online.target
 

@@ -1,19 +1,17 @@
 //! allowlist-sync
 //!
-//! Keeps an rnostr `[auth]` pubkey allowlist in sync with a NIP-34 git
-//! repository announcement (kind 30617) published by a trusted authority.
+//! Keeps an rnostr `[auth]` pubkey allowlist in sync with the private,
+//! per-recipient registry events published by shareholder-governance-registry.
 //!
-//! The announced set is `{event author} ∪ {pubkeys in the `maintainers` tag}`.
-//! Locally configured `--extra-pubkey` operators are unioned on top of it at
-//! write time. The result is written into both `[auth.req].pubkey_whitelist`
-//! (read, NIP-42) and `[auth.event].event_pubkey_whitelist` (write, by author)
-//! of the rnostr config file, and `allow_mentioning_whitelisted_pubkeys` is
-//! forced off because it would waive that write check. rnostr is expected to
-//! run with `--watch` so the edits apply live without a restart. The winning
-//! event version and the *announced* allowlist are stored beside the config in
-//! `<config-name>.allowlist-sync-state` for rollback and offline drift
-//! protection; extras stay out of that file so changing them takes effect on
-//! the next write, even while offline.
+//! The event is selected by its trusted author, configured kind, and recipient
+//! pubkey in its `d` and `p` tags. Its NIP-44 v2 content is decrypted with the
+//! recipient key and decoded as a JSON array of npubs. The effective allowlist
+//! is `{event author} and {decrypted shareholders} and {local extras}`. The
+//! author is retained so it can keep publishing updates to the managed relay.
+//! The result is written into both `[auth.req].pubkey_whitelist` (read, NIP-42)
+//! and `[auth.event].event_pubkey_whitelist` (write, by author). The winning
+//! event version and decrypted allowlist are stored beside the config for
+//! rollback and offline drift protection.
 
 use std::{
     cmp::Ordering,
@@ -24,7 +22,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::{fs::MetadataExt, io::AsRawFd};
+use std::os::unix::{fs::MetadataExt, fs::PermissionsExt, io::AsRawFd};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -33,24 +31,28 @@ use tempfile::NamedTempFile;
 use toml_edit::{table, value, Array, DocumentMut, TableLike};
 use tracing::{info, warn};
 
-/// NIP-34 git repository announcement kind.
-const REPO_ANNOUNCEMENT_KIND: u16 = 30617;
+/// Default kind used by shareholder-governance-registry.
+const DEFAULT_REGISTRY_EVENT_KIND: u16 = 30617;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "allowlist-sync",
-    about = "Sync an rnostr [auth] allowlist from a NIP-34 kind-30617 repo announcement."
+    about = "Sync an rnostr [auth] allowlist from encrypted shareholder registry events."
 )]
 struct Cli {
-    /// Authority pubkey (repo owner) to trust, as npub or 64-char hex.
+    /// Registry operator pubkey to trust, as npub or 64-char hex.
     #[arg(long, env = "ALLOWLIST_AUTHORITY")]
     authority: String,
 
-    /// The `d` tag identifier of the kind-30617 repo announcement.
-    #[arg(long, env = "ALLOWLIST_IDENTIFIER")]
-    identifier: String,
+    /// File containing the stable recipient nsec used to decrypt the registry.
+    #[arg(long, env = "ALLOWLIST_RECIPIENT_NSEC_FILE")]
+    recipient_nsec_file: PathBuf,
 
-    /// Source relay(s) to fetch the announcement from (repeatable).
+    /// Addressable event kind used by the registry.
+    #[arg(long, env = "ALLOWLIST_EVENT_KIND", default_value_t = DEFAULT_REGISTRY_EVENT_KIND)]
+    event_kind: u16,
+
+    /// Source relay(s) to fetch the encrypted registry snapshot from (repeatable).
     #[arg(
         long = "relay",
         env = "ALLOWLIST_RELAYS",
@@ -59,7 +61,7 @@ struct Cli {
     )]
     relays: Vec<String>,
 
-    /// Extra pubkey(s) to always allow, in addition to the announced set
+    /// Extra pubkey(s) to always allow, in addition to the registry set
     /// (repeatable). Accepts npub or 64-char hex.
     #[arg(
         long = "extra-pubkey",
@@ -80,7 +82,7 @@ struct Cli {
     #[arg(long, default_value = "10s", value_parser = humantime_secs)]
     fetch_timeout: Duration,
 
-    /// How often to refetch the latest announcement, including after transient failures.
+    /// How often to refetch the latest snapshot, including after transient failures.
     #[arg(long, env = "ALLOWLIST_RESYNC_INTERVAL", default_value = "60s", value_parser = humantime_secs)]
     resync_interval: Duration,
 }
@@ -99,6 +101,27 @@ fn humantime_secs(s: &str) -> Result<Duration, String> {
     Ok(duration)
 }
 
+fn read_recipient_keys(path: &Path) -> Result<Keys> {
+    #[cfg(unix)]
+    {
+        let mode = fs::metadata(path)
+            .with_context(|| format!("cannot inspect recipient nsec file {}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "recipient nsec file {} is accessible by group or others; set its mode to 0600",
+                path.display()
+            );
+        }
+    }
+
+    let nsec = fs::read_to_string(path)
+        .with_context(|| format!("cannot read recipient nsec file {}", path.display()))?;
+    Keys::parse(nsec.trim())
+        .with_context(|| format!("invalid recipient nsec in {}", path.display()))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -112,22 +135,42 @@ async fn main() -> Result<()> {
 
     let authority = PublicKey::parse(&cli.authority)
         .with_context(|| format!("invalid authority pubkey: {}", cli.authority))?;
+    let recipient_keys = read_recipient_keys(&cli.recipient_nsec_file)?;
+    let recipient = recipient_keys.public_key();
+    if recipient != authority {
+        anyhow::bail!(
+            "recipient nsec {} does not belong to registry authority {}; \
+             the registry's always-published self-copy requires the authority nsec",
+            cli.recipient_nsec_file.display(),
+            authority.to_hex()
+        );
+    }
+    let kind = Kind::from(cli.event_kind);
+    if !kind.is_addressable() {
+        anyhow::bail!(
+            "registry event kind {} is not in the addressable range",
+            cli.event_kind
+        );
+    }
     let extras = parse_extra_pubkeys(&cli.extra_pubkeys)?;
     info!(
         authority = %authority.to_hex(),
-        identifier = %cli.identifier,
+        recipient = %recipient.to_hex(),
+        kind = cli.event_kind,
         extras = extras.len(),
         "starting allowlist-sync"
     );
 
-    // Ephemeral signer so the client can answer NIP-42 challenges from source
-    // relays that require auth (best effort; prefer an independent relay).
-    let keys = Keys::generate();
+    // Use the stable recipient identity for NIP-42 too. This lets an operator
+    // explicitly allow the sidecar on an authenticated source relay.
     let opts = ClientOptions::new()
         .automatic_authentication(true)
         .verify_subscriptions(true)
         .ban_relay_on_mismatch(true);
-    let client = Client::builder().signer(keys).opts(opts).build();
+    let client = Client::builder()
+        .signer(recipient_keys.clone())
+        .opts(opts)
+        .build();
 
     for relay in &cli.relays {
         client
@@ -139,29 +182,34 @@ async fn main() -> Result<()> {
 
     let filter = Filter::new()
         .author(authority)
-        .kind(Kind::Custom(REPO_ANNOUNCEMENT_KIND))
-        .identifier(cli.identifier.clone());
+        .kind(kind)
+        .identifier(recipient.to_hex())
+        .pubkey(recipient);
+    let source = RegistrySource {
+        filter: &filter,
+        recipient_keys: &recipient_keys,
+    };
 
     // Persist the full NIP-01 replacement version so a stale relay cannot roll
     // the allowlist back after this process restarts.
     let version_store =
-        EventVersionStore::for_config(&cli.config, authority, cli.identifier.clone())?;
+        EventVersionStore::for_config(&cli.config, authority, recipient, cli.event_kind)?;
     let mut last_applied = version_store.load()?;
     if let Some(state) = last_applied.as_ref() {
         info!(
             created_at = state.version.created_at,
             event_id = %state.version.id.to_hex(),
             count = state.allowed.len(),
-            "loaded last applied announcement version"
+            "loaded last applied registry snapshot version"
         );
     }
 
-    // Initial sync: fetch the current announcement and apply it. One-shot mode
-    // must report a missing announcement or fetch failure to its caller, while
+    // Initial sync: fetch the current snapshot and apply it. One-shot mode
+    // must report a missing snapshot or fetch failure to its caller, while
     // live mode continues into its subscription and periodic retry loop.
     let initial_sync = sync_latest(
         &client,
-        &filter,
+        &source,
         cli.fetch_timeout,
         &cli.config,
         &extras,
@@ -175,7 +223,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Live mode: subscribe and re-apply whenever a newer announcement arrives.
+    // Live mode: subscribe and re-apply whenever a newer snapshot arrives.
     // Subscribe to notifications before opening the live subscription so an
     // event cannot arrive in between those operations and be missed.
     let mut notifications = client.notifications();
@@ -184,7 +232,7 @@ async fn main() -> Result<()> {
         .await
         .context("subscribe failed")?
         .val;
-    info!("subscribed; watching for announcement updates (Ctrl-C to stop)");
+    info!("subscribed; watching for registry updates (Ctrl-C to stop)");
 
     let mut resync = tokio::time::interval(cli.resync_interval);
     resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -203,7 +251,7 @@ async fn main() -> Result<()> {
             _ = resync.tick() => {
                 if let Err(err) = sync_latest(
                     &client,
-                    &filter,
+                    &source,
                     cli.fetch_timeout,
                     &cli.config,
                     &extras,
@@ -223,21 +271,22 @@ async fn main() -> Result<()> {
                         if let Err(err) = process_event(
                             &event,
                             &filter,
+                            &recipient_keys,
                             &cli.config,
                             &extras,
                             &version_store,
                             &mut last_applied,
                         ) {
-                            warn!(error = %err, "failed to apply announcement update; periodic resync will retry");
+                            warn!(error = %err, "failed to apply registry update; periodic resync will retry");
                         }
                     }
                     Ok(RelayPoolNotification::Shutdown) => break,
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "notification receiver lagged; refetching latest announcement");
+                        warn!(skipped, "notification receiver lagged; refetching latest registry snapshot");
                         if let Err(err) = sync_latest(
                             &client,
-                            &filter,
+                            &source,
                             cli.fetch_timeout,
                             &cli.config,
                             &extras,
@@ -262,10 +311,10 @@ fn handle_initial_sync_result(result: Result<bool>, once: bool) -> Result<()> {
     match result {
         Ok(true) => Ok(()),
         Ok(false) if once => {
-            anyhow::bail!("no matching kind-30617 announcement found")
+            anyhow::bail!("no matching registry event found")
         }
         Ok(false) => {
-            warn!("no matching kind-30617 announcement found on initial fetch; will retry");
+            warn!("no matching registry event found on initial fetch; will retry");
             Ok(())
         }
         Err(err) if once => Err(err).context("initial fetch failed"),
@@ -306,11 +355,17 @@ struct AppliedEvent {
 struct EventVersionStore {
     path: PathBuf,
     authority: String,
-    identifier: String,
+    recipient: String,
+    event_kind: u16,
 }
 
 impl EventVersionStore {
-    fn for_config(config: &Path, authority: PublicKey, identifier: String) -> Result<Self> {
+    fn for_config(
+        config: &Path,
+        authority: PublicKey,
+        recipient: PublicKey,
+        event_kind: u16,
+    ) -> Result<Self> {
         let resolved = fs::canonicalize(config)
             .with_context(|| format!("cannot resolve {}", config.display()))?;
         let file_name = resolved
@@ -322,16 +377,18 @@ impl EventVersionStore {
         Ok(Self {
             path: resolved.with_file_name(state_file_name),
             authority: authority.to_hex(),
-            identifier,
+            recipient: recipient.to_hex(),
+            event_kind,
         })
     }
 
     #[cfg(test)]
-    fn at(path: PathBuf, authority: PublicKey, identifier: impl Into<String>) -> Self {
+    fn at(path: PathBuf, authority: PublicKey, recipient: PublicKey, event_kind: u16) -> Self {
         Self {
             path,
             authority: authority.to_hex(),
-            identifier: identifier.into(),
+            recipient: recipient.to_hex(),
+            event_kind,
         }
     }
 
@@ -355,17 +412,35 @@ impl EventVersionStore {
                 .with_context(|| format!("missing or invalid `{key}` in {}", self.path.display()))
         };
 
-        let authority = string_field("authority")?;
-        let identifier = string_field("identifier")?;
-        if authority != self.authority || identifier != self.identifier {
-            // Refuse rather than reset: one repo's rollback floor must not be
-            // inherited by another.
+        if doc.get("recipient").is_none() && doc.get("identifier").is_some() {
             anyhow::bail!(
-                "{} belongs to authority {authority} identifier {identifier:?}, not authority {} identifier {:?}; \
-                 delete {} to start tracking the new authority/identifier",
+                "{} uses the obsolete public-announcement state format; delete it once to start tracking private registry events",
+                self.path.display()
+            );
+        }
+
+        let authority = string_field("authority")?;
+        let recipient = string_field("recipient")?;
+        let event_kind = doc
+            .get("event_kind")
+            .and_then(|item| item.as_integer())
+            .and_then(|kind| u16::try_from(kind).ok())
+            .with_context(|| {
+                format!("missing or invalid `event_kind` in {}", self.path.display())
+            })?;
+        if authority != self.authority
+            || recipient != self.recipient
+            || event_kind != self.event_kind
+        {
+            // Refuse rather than reset: one event address's rollback floor
+            // must not be inherited by another.
+            anyhow::bail!(
+                "{} belongs to authority {authority} recipient {recipient} kind {event_kind}, \
+                 not authority {} recipient {} kind {}; delete {} to start tracking the new registry event",
                 self.path.display(),
                 self.authority,
-                self.identifier,
+                self.recipient,
+                self.event_kind,
                 self.path.display()
             );
         }
@@ -403,7 +478,8 @@ impl EventVersionStore {
         let mut doc = DocumentMut::new();
         let root = doc.as_table_mut();
         root.insert("authority", value(self.authority.as_str()));
-        root.insert("identifier", value(self.identifier.as_str()));
+        root.insert("recipient", value(self.recipient.as_str()));
+        root.insert("event_kind", value(i64::from(self.event_kind)));
         root.insert("created_at", value(state.version.created_at.to_string()));
         root.insert("event_id", value(state.version.id.to_hex()));
         root.insert("allowed", value(hex_array(&state.allowed)));
@@ -441,9 +517,14 @@ impl EventVersionStore {
     }
 }
 
+struct RegistrySource<'a> {
+    filter: &'a Filter,
+    recipient_keys: &'a Keys,
+}
+
 async fn sync_latest(
     client: &Client,
-    filter: &Filter,
+    source: &RegistrySource<'_>,
     timeout: Duration,
     config: &Path,
     extras: &[String],
@@ -453,13 +534,21 @@ async fn sync_latest(
     reconcile_config(config, extras, last_applied.as_ref())?;
 
     let events = client
-        .fetch_events(filter.clone(), timeout)
+        .fetch_events(source.filter.clone(), timeout)
         .await
         .context("fetch failed")?;
     let Some(event) = latest_event(events) else {
         return Ok(false);
     };
-    process_event(&event, filter, config, extras, version_store, last_applied)?;
+    process_event(
+        &event,
+        source.filter,
+        source.recipient_keys,
+        config,
+        extras,
+        version_store,
+        last_applied,
+    )?;
     Ok(true)
 }
 
@@ -499,11 +588,12 @@ fn compare_event_versions(a: &Event, b: &Event) -> Ordering {
         .then_with(|| b.id.cmp(&a.id))
 }
 
-/// Apply an announcement unless it is older than the persisted winner. Applying
+/// Apply a registry snapshot unless it is older than the persisted winner. Applying
 /// the current winner again is intentional so config drift is repaired.
 fn process_event(
     event: &Event,
     filter: &Filter,
+    recipient_keys: &Keys,
     config: &Path,
     extras: &[String],
     version_store: &EventVersionStore,
@@ -513,7 +603,7 @@ fn process_event(
     // an unrelated notification reach this security-sensitive write path.
     if !filter.match_event(event, MatchEventOptions::new()) {
         anyhow::bail!(
-            "event {} does not match the configured authority/repository",
+            "event {} does not match the configured authority/recipient",
             event.id
         );
     }
@@ -530,12 +620,7 @@ fn process_event(
         }
     }
 
-    let allowed = collect_allowed(event);
-    // Unreachable while `collect_allowed` inserts the author, but an empty
-    // whitelist would lock every client out, so keep it enforced.
-    if allowed.is_empty() {
-        anyhow::bail!("announcement {} yielded an empty allowlist", event.id);
-    }
+    let allowed = decrypt_allowed(event, recipient_keys)?;
 
     let state = AppliedEvent { version, allowed };
     if persist_state {
@@ -579,14 +664,14 @@ fn parse_extra_pubkeys(raw: &[String]) -> Result<Vec<String>> {
     Ok(set.into_iter().collect())
 }
 
-/// Overlay the locally configured extras on top of the announced set. Extras
-/// are applied at write time only, so they are never persisted as if the
-/// authority had announced them.
-fn union_allowed(announced: &[String], extras: &[String]) -> Vec<String> {
+/// Overlay the locally configured extras on top of the registry set. Extras
+/// are applied at write time only, so they are never persisted as registry
+/// data.
+fn union_allowed(registry: &[String], extras: &[String]) -> Vec<String> {
     if extras.is_empty() {
-        return announced.to_vec();
+        return registry.to_vec();
     }
-    let set: std::collections::BTreeSet<&str> = announced
+    let set: std::collections::BTreeSet<&str> = registry
         .iter()
         .chain(extras.iter())
         .map(String::as_str)
@@ -594,27 +679,28 @@ fn union_allowed(announced: &[String], extras: &[String]) -> Vec<String> {
     set.into_iter().map(str::to_owned).collect()
 }
 
-/// Allowed set = author pubkey ∪ maintainers tag pubkeys, as sorted, deduped hex.
-fn collect_allowed(event: &Event) -> Vec<String> {
+/// Decrypt the registry snapshot and return author and shareholders as sorted,
+/// deduplicated hex pubkeys. The author stays allowed so it can publish the
+/// next snapshot to the managed relay even when it owns no shares itself.
+fn decrypt_allowed(event: &Event, recipient_keys: &Keys) -> Result<Vec<String>> {
+    let plaintext = nip44::decrypt(recipient_keys.secret_key(), &event.pubkey, &event.content)
+        .with_context(|| format!("cannot decrypt registry event {}", event.id))?;
+    let shareholders: Vec<String> = serde_json::from_str(&plaintext)
+        .with_context(|| format!("registry event {} is not a JSON pubkey array", event.id))?;
+
     let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     set.insert(event.pubkey.to_hex());
-
-    for tag in event.tags.iter() {
-        let slice = tag.as_slice();
-        if slice.first().map(|s| s.as_str()) == Some("maintainers") {
-            for raw in &slice[1..] {
-                // Tag values are hex; validate and normalize via PublicKey.
-                match PublicKey::parse(raw) {
-                    Ok(pk) => {
-                        set.insert(pk.to_hex());
-                    }
-                    Err(_) => warn!(value = %raw, "skipping invalid maintainer pubkey"),
-                }
-            }
-        }
+    for raw in shareholders {
+        let pubkey = PublicKey::parse(&raw).with_context(|| {
+            format!(
+                "registry event {} contains invalid pubkey {raw:?}",
+                event.id
+            )
+        })?;
+        set.insert(pubkey.to_hex());
     }
 
-    set.into_iter().collect()
+    Ok(set.into_iter().collect())
 }
 
 /// Surgically set `[auth].enabled = true` and both whitelists to `hexes`,
@@ -789,6 +875,10 @@ mod tests {
     const PK_C: &str = "0000000000000000000000000000000000000000000000000000000000000003";
     const NO_EXTRAS: &[String] = &[];
 
+    fn recipient_keys() -> Keys {
+        Keys::parse("0000000000000000000000000000000000000000000000000000000000000004").unwrap()
+    }
+
     fn write_tmp(name: &str, content: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("allowlist-sync-tests");
         std::fs::create_dir_all(&dir).unwrap();
@@ -797,45 +887,45 @@ mod tests {
         path
     }
 
-    fn announcement(keys: &Keys, identifier: &str, created_at: Timestamp, content: &str) -> Event {
-        EventBuilder::new(Kind::Custom(REPO_ANNOUNCEMENT_KIND), content)
-            .tags([Tag::identifier(identifier)])
-            .custom_created_at(created_at)
-            .sign_with_keys(keys)
-            .unwrap()
-    }
-
-    fn announcement_with_maintainers(
-        keys: &Keys,
-        identifier: &str,
-        created_at: Timestamp,
-        maintainers: &[&str],
-    ) -> Event {
-        let maintainer_tag = std::iter::once("maintainers")
-            .chain(maintainers.iter().copied())
-            .collect::<Vec<_>>();
-        EventBuilder::new(Kind::Custom(REPO_ANNOUNCEMENT_KIND), "")
+    fn encrypted_registry_event(keys: &Keys, created_at: Timestamp, content: &str) -> Event {
+        let recipient = recipient_keys();
+        let cipher = nip44::encrypt(
+            keys.secret_key(),
+            &recipient.public_key(),
+            content,
+            nip44::Version::V2,
+        )
+        .unwrap();
+        EventBuilder::new(Kind::from(DEFAULT_REGISTRY_EVENT_KIND), cipher)
             .tags([
-                Tag::identifier(identifier),
-                Tag::parse(maintainer_tag).unwrap(),
+                Tag::identifier(recipient.public_key().to_hex()),
+                Tag::public_key(recipient.public_key()),
             ])
             .custom_created_at(created_at)
             .sign_with_keys(keys)
             .unwrap()
     }
 
-    fn announcement_filter(keys: &Keys, identifier: &str) -> Filter {
-        Filter::new()
-            .author(keys.public_key())
-            .kind(Kind::Custom(REPO_ANNOUNCEMENT_KIND))
-            .identifier(identifier)
+    fn registry_snapshot(keys: &Keys, created_at: Timestamp, shareholders: &[&str]) -> Event {
+        let payload = serde_json::to_string(shareholders).unwrap();
+        encrypted_registry_event(keys, created_at, &payload)
     }
 
-    fn version_store(config: &Path, keys: &Keys, identifier: &str) -> EventVersionStore {
+    fn registry_filter(keys: &Keys) -> Filter {
+        let recipient = recipient_keys().public_key();
+        Filter::new()
+            .author(keys.public_key())
+            .kind(Kind::from(DEFAULT_REGISTRY_EVENT_KIND))
+            .identifier(recipient.to_hex())
+            .pubkey(recipient)
+    }
+
+    fn version_store(config: &Path, keys: &Keys) -> EventVersionStore {
         EventVersionStore::at(
             config.with_extension("allowlist-sync-state"),
             keys.public_key(),
-            identifier,
+            recipient_keys().public_key(),
+            DEFAULT_REGISTRY_EVENT_KIND,
         )
     }
 
@@ -1034,16 +1124,18 @@ event_pubkey_whitelist = []
     }
 
     #[test]
-    fn collect_allowed_unions_author_and_maintainers() {
-        let keys = Keys::generate();
-        let author_hex = keys.public_key().to_hex();
-        let maintainers = Tag::parse(["maintainers", PK_A, PK_B]).unwrap();
-        let event = EventBuilder::new(Kind::Custom(REPO_ANNOUNCEMENT_KIND), "")
-            .tags([maintainers])
-            .sign_with_keys(&keys)
-            .unwrap();
+    fn decrypt_allowed_unions_author_and_shareholders() {
+        let authority = Keys::generate();
+        let shareholder_a = PublicKey::parse(PK_A).unwrap().to_bech32().unwrap();
+        let shareholder_b = PublicKey::parse(PK_B).unwrap().to_bech32().unwrap();
+        let event = registry_snapshot(
+            &authority,
+            Timestamp::from(10),
+            &[&shareholder_a, &shareholder_b],
+        );
 
-        let allowed = collect_allowed(&event);
+        let allowed = decrypt_allowed(&event, &recipient_keys()).unwrap();
+        let author_hex = authority.public_key().to_hex();
         assert!(allowed.contains(&author_hex));
         assert!(allowed.contains(&PK_A.to_string()));
         assert!(allowed.contains(&PK_B.to_string()));
@@ -1055,35 +1147,46 @@ event_pubkey_whitelist = []
     }
 
     #[test]
-    fn collect_allowed_always_includes_the_author() {
-        let keys = Keys::generate();
-        let author = vec![keys.public_key().to_hex()];
+    fn decrypt_allowed_keeps_author_for_an_empty_registry() {
+        let authority = Keys::generate();
+        let event = registry_snapshot(&authority, Timestamp::from(10), &[]);
+        assert_eq!(
+            decrypt_allowed(&event, &recipient_keys()).unwrap(),
+            vec![authority.public_key().to_hex()]
+        );
+    }
 
-        // Neither a missing `maintainers` tag nor an all-junk one empties the set.
-        let bare = announcement(&keys, "repo", Timestamp::from(10), "");
-        assert_eq!(collect_allowed(&bare), author);
+    #[test]
+    fn decrypt_allowed_rejects_wrong_recipient_and_invalid_payload() {
+        let authority = Keys::generate();
+        let valid = registry_snapshot(&authority, Timestamp::from(10), &[PK_A]);
+        assert!(decrypt_allowed(&valid, &Keys::generate()).is_err());
 
-        let junk =
-            announcement_with_maintainers(&keys, "repo", Timestamp::from(10), &["not-a-pubkey"]);
-        assert_eq!(collect_allowed(&junk), author);
+        let malformed = encrypted_registry_event(&authority, Timestamp::from(11), "not json");
+        assert!(decrypt_allowed(&malformed, &recipient_keys()).is_err());
+
+        let invalid_pubkey = registry_snapshot(&authority, Timestamp::from(12), &["not-a-pubkey"]);
+        assert!(decrypt_allowed(&invalid_pubkey, &recipient_keys()).is_err());
     }
 
     #[test]
     fn rejects_event_that_does_not_match_trusted_filter() {
         let authority = Keys::generate();
         let attacker = Keys::generate();
-        let filter = announcement_filter(&authority, "trusted-repo");
-        let event = announcement(&attacker, "trusted-repo", Timestamp::from(10), "");
+        let filter = registry_filter(&authority);
+        let event = encrypted_registry_event(&attacker, Timestamp::from(10), "[]");
         let store = EventVersionStore::at(
             PathBuf::from("unused-for-rejected-events.state"),
             authority.public_key(),
-            "trusted-repo",
+            recipient_keys().public_key(),
+            DEFAULT_REGISTRY_EVENT_KIND,
         );
         let mut last_applied = None;
 
         let err = process_event(
             &event,
             &filter,
+            &recipient_keys(),
             Path::new("unused-for-rejected-events"),
             NO_EXTRAS,
             &store,
@@ -1098,8 +1201,8 @@ event_pubkey_whitelist = []
     fn lower_id_wins_equal_timestamp_tie() {
         let keys = Keys::generate();
         let timestamp = Timestamp::from(10);
-        let first = announcement(&keys, "repo", timestamp, "first");
-        let second = announcement(&keys, "repo", timestamp, "second");
+        let first = encrypted_registry_event(&keys, timestamp, "first");
+        let second = encrypted_registry_event(&keys, timestamp, "second");
         let expected = std::cmp::min(first.id, second.id);
 
         let latest = latest_event([first, second]).unwrap();
@@ -1107,17 +1210,47 @@ event_pubkey_whitelist = []
     }
 
     #[test]
+    fn obsolete_public_announcement_state_requires_one_time_removal() {
+        let authority = Keys::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist-sync.state");
+        std::fs::write(
+            &path,
+            format!(
+                "authority = {:?}\nidentifier = \"old-repository\"\n",
+                authority.public_key().to_hex()
+            ),
+        )
+        .unwrap();
+        let store = EventVersionStore::at(
+            path,
+            authority.public_key(),
+            recipient_keys().public_key(),
+            DEFAULT_REGISTRY_EVENT_KIND,
+        );
+
+        assert!(store.load().unwrap_err().to_string().contains("obsolete"));
+    }
+
+    #[test]
     fn persisted_state_repairs_failed_config_without_refetch() {
         let keys = Keys::generate();
-        let filter = announcement_filter(&keys, "repo");
-        let event = announcement(&keys, "repo", Timestamp::from(10), "");
+        let filter = registry_filter(&keys);
+        let event = registry_snapshot(&keys, Timestamp::from(10), &[]);
         let path = write_tmp("retry.toml", "not valid toml = [");
-        let store = version_store(&path, &keys, "repo");
+        let store = version_store(&path, &keys);
         let mut last_applied = None;
 
-        assert!(
-            process_event(&event, &filter, &path, NO_EXTRAS, &store, &mut last_applied).is_err()
-        );
+        assert!(process_event(
+            &event,
+            &filter,
+            &recipient_keys(),
+            &path,
+            NO_EXTRAS,
+            &store,
+            &mut last_applied,
+        )
+        .is_err());
         assert_eq!(
             last_applied.as_ref().map(|state| state.version.clone()),
             Some(EventVersion::new(&event))
@@ -1135,16 +1268,34 @@ event_pubkey_whitelist = []
     #[test]
     fn same_event_repairs_config_drift() {
         let keys = Keys::generate();
-        let filter = announcement_filter(&keys, "repo");
-        let event = announcement_with_maintainers(&keys, "repo", Timestamp::from(10), &[PK_A]);
+        let filter = registry_filter(&keys);
+        let event = registry_snapshot(&keys, Timestamp::from(10), &[PK_A]);
         let path = write_tmp("drift.toml", "[auth]\nenabled = false\n");
-        let store = version_store(&path, &keys, "repo");
+        let store = version_store(&path, &keys);
         let mut last_applied = None;
 
-        process_event(&event, &filter, &path, NO_EXTRAS, &store, &mut last_applied).unwrap();
+        process_event(
+            &event,
+            &filter,
+            &recipient_keys(),
+            &path,
+            NO_EXTRAS,
+            &store,
+            &mut last_applied,
+        )
+        .unwrap();
         std::fs::write(&path, "[auth]\nenabled = false\n").unwrap();
 
-        process_event(&event, &filter, &path, NO_EXTRAS, &store, &mut last_applied).unwrap();
+        process_event(
+            &event,
+            &filter,
+            &recipient_keys(),
+            &path,
+            NO_EXTRAS,
+            &store,
+            &mut last_applied,
+        )
+        .unwrap();
 
         let doc: DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(doc["auth"]["enabled"].as_bool(), Some(true));
@@ -1155,16 +1306,17 @@ event_pubkey_whitelist = []
     #[test]
     fn persisted_version_rejects_stale_event_after_restart() {
         let keys = Keys::generate();
-        let filter = announcement_filter(&keys, "repo");
-        let stale = announcement_with_maintainers(&keys, "repo", Timestamp::from(10), &[PK_A]);
-        let current = announcement_with_maintainers(&keys, "repo", Timestamp::from(20), &[PK_B]);
+        let filter = registry_filter(&keys);
+        let stale = registry_snapshot(&keys, Timestamp::from(10), &[PK_A]);
+        let current = registry_snapshot(&keys, Timestamp::from(20), &[PK_B]);
         let path = write_tmp("rollback.toml", "[auth]\nenabled = false\n");
-        let store = version_store(&path, &keys, "repo");
+        let store = version_store(&path, &keys);
         let mut last_applied = None;
 
         process_event(
             &current,
             &filter,
+            &recipient_keys(),
             &path,
             NO_EXTRAS,
             &store,
@@ -1176,6 +1328,7 @@ event_pubkey_whitelist = []
         process_event(
             &stale,
             &filter,
+            &recipient_keys(),
             &path,
             NO_EXTRAS,
             &store,
@@ -1220,16 +1373,25 @@ event_pubkey_whitelist = []
     }
 
     #[test]
-    fn extras_are_written_to_config_but_not_persisted_as_announced() {
+    fn extras_are_written_to_config_but_not_persisted_as_registry_data() {
         let keys = Keys::generate();
-        let filter = announcement_filter(&keys, "repo");
-        let event = announcement_with_maintainers(&keys, "repo", Timestamp::from(10), &[PK_A]);
+        let filter = registry_filter(&keys);
+        let event = registry_snapshot(&keys, Timestamp::from(10), &[PK_A]);
         let path = write_tmp("extras.toml", "[auth]\nenabled = false\n");
-        let store = version_store(&path, &keys, "repo");
+        let store = version_store(&path, &keys);
         let extras = vec![PK_C.to_owned()];
         let mut last_applied = None;
 
-        process_event(&event, &filter, &path, &extras, &store, &mut last_applied).unwrap();
+        process_event(
+            &event,
+            &filter,
+            &recipient_keys(),
+            &path,
+            &extras,
+            &store,
+            &mut last_applied,
+        )
+        .unwrap();
 
         let doc: DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         for whitelist in [
@@ -1256,16 +1418,25 @@ event_pubkey_whitelist = []
     #[test]
     fn changed_extras_apply_offline_from_persisted_state() {
         let keys = Keys::generate();
-        let filter = announcement_filter(&keys, "repo");
-        let event = announcement_with_maintainers(&keys, "repo", Timestamp::from(10), &[PK_A]);
+        let filter = registry_filter(&keys);
+        let event = registry_snapshot(&keys, Timestamp::from(10), &[PK_A]);
         let path = write_tmp("extras-offline.toml", "[auth]\nenabled = false\n");
-        let store = version_store(&path, &keys, "repo");
+        let store = version_store(&path, &keys);
         let mut last_applied = None;
 
-        process_event(&event, &filter, &path, NO_EXTRAS, &store, &mut last_applied).unwrap();
+        process_event(
+            &event,
+            &filter,
+            &recipient_keys(),
+            &path,
+            NO_EXTRAS,
+            &store,
+            &mut last_applied,
+        )
+        .unwrap();
 
         // Restart with a new extra key and no relay reachable: reconciling the
-        // persisted announcement must still pick the new extra up.
+        // persisted registry snapshot must still pick the new extra up.
         let after_restart = store.load().unwrap();
         reconcile_config(&path, &[PK_C.to_owned()], after_restart.as_ref()).unwrap();
 
@@ -1278,16 +1449,34 @@ event_pubkey_whitelist = []
     #[test]
     fn removed_extras_are_dropped_on_the_next_write() {
         let keys = Keys::generate();
-        let filter = announcement_filter(&keys, "repo");
-        let event = announcement_with_maintainers(&keys, "repo", Timestamp::from(10), &[PK_A]);
+        let filter = registry_filter(&keys);
+        let event = registry_snapshot(&keys, Timestamp::from(10), &[PK_A]);
         let path = write_tmp("extras-removed.toml", "[auth]\nenabled = false\n");
-        let store = version_store(&path, &keys, "repo");
+        let store = version_store(&path, &keys);
         let mut last_applied = None;
 
         let extras = vec![PK_C.to_owned()];
-        process_event(&event, &filter, &path, &extras, &store, &mut last_applied).unwrap();
+        process_event(
+            &event,
+            &filter,
+            &recipient_keys(),
+            &path,
+            &extras,
+            &store,
+            &mut last_applied,
+        )
+        .unwrap();
         // Same event, extras dropped from the command line.
-        process_event(&event, &filter, &path, NO_EXTRAS, &store, &mut last_applied).unwrap();
+        process_event(
+            &event,
+            &filter,
+            &recipient_keys(),
+            &path,
+            NO_EXTRAS,
+            &store,
+            &mut last_applied,
+        )
+        .unwrap();
 
         let doc: DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         let req = doc["auth"]["req"]["pubkey_whitelist"].as_array().unwrap();
@@ -1296,28 +1485,46 @@ event_pubkey_whitelist = []
     }
 
     #[test]
-    fn extras_survive_a_superseding_announcement() {
+    fn extras_survive_a_superseding_snapshot() {
         let keys = Keys::generate();
-        let filter = announcement_filter(&keys, "repo");
-        let first = announcement_with_maintainers(&keys, "repo", Timestamp::from(10), &[PK_A]);
-        let second = announcement_with_maintainers(&keys, "repo", Timestamp::from(20), &[PK_B]);
+        let filter = registry_filter(&keys);
+        let first = registry_snapshot(&keys, Timestamp::from(10), &[PK_A]);
+        let second = registry_snapshot(&keys, Timestamp::from(20), &[PK_B]);
         let path = write_tmp("extras-superseded.toml", "[auth]\nenabled = false\n");
-        let store = version_store(&path, &keys, "repo");
+        let store = version_store(&path, &keys);
         let extras = vec![PK_C.to_owned()];
         let mut last_applied = None;
 
-        process_event(&first, &filter, &path, &extras, &store, &mut last_applied).unwrap();
-        process_event(&second, &filter, &path, &extras, &store, &mut last_applied).unwrap();
+        process_event(
+            &first,
+            &filter,
+            &recipient_keys(),
+            &path,
+            &extras,
+            &store,
+            &mut last_applied,
+        )
+        .unwrap();
+        process_event(
+            &second,
+            &filter,
+            &recipient_keys(),
+            &path,
+            &extras,
+            &store,
+            &mut last_applied,
+        )
+        .unwrap();
 
         let doc: DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         let req = doc["auth"]["req"]["pubkey_whitelist"].as_array().unwrap();
-        // The newer announcement replaces the maintainer it dropped, but the
+        // The newer snapshot replaces the shareholder it dropped, but the
         // locally configured extra is not the authority's to revoke.
         assert!(req.iter().any(|value| value.as_str() == Some(PK_B)));
         assert!(!req.iter().any(|value| value.as_str() == Some(PK_A)));
         assert!(req.iter().any(|value| value.as_str() == Some(PK_C)));
 
-        // Still absent from the state file, which tracks only the announcement.
+        // Still absent from the state file, which tracks only the registry snapshot.
         let persisted = store.load().unwrap().unwrap();
         assert_eq!(persisted.version, EventVersion::new(&second));
         assert!(!persisted.allowed.contains(&PK_C.to_owned()));
@@ -1330,14 +1537,38 @@ event_pubkey_whitelist = []
         assert!(humantime_secs("10ss").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn one_shot_requires_an_announcement() {
+    fn recipient_nsec_file_must_be_private() {
+        let keys = Keys::generate();
+        let path = write_tmp(
+            "recipient.nsec",
+            &format!("{}\n", keys.secret_key().to_bech32().unwrap()),
+        );
+
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        assert!(read_recipient_keys(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("mode to 0600"));
+
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        assert_eq!(
+            read_recipient_keys(&path).unwrap().public_key(),
+            keys.public_key()
+        );
+    }
+
+    #[test]
+    fn one_shot_requires_a_registry_event() {
         assert!(handle_initial_sync_result(Ok(true), true).is_ok());
 
         let err = handle_initial_sync_result(Ok(false), true).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("no matching kind-30617 announcement"));
+        assert!(err.to_string().contains("no matching registry event"));
     }
 
     #[test]
