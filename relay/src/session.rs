@@ -56,6 +56,13 @@ impl Session {
             .and_then(|boxed| boxed.downcast_ref())
     }
 
+    /// get extension data for in-place mutation
+    pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        self.data
+            .get_mut(&TypeId::of::<T>())
+            .and_then(|boxed| boxed.downcast_mut())
+    }
+
     /// Get session id
     pub fn id(&self) -> usize {
         self.id
@@ -117,6 +124,8 @@ impl Session {
             ));
         } else if let IncomingMessage::Req(sub) = &msg.msg {
             ctx.text(OutgoingMessage::closed(&sub.id, &err.to_string()));
+        } else if let IncomingMessage::NegOpen(open) = &msg.msg {
+            ctx.text(OutgoingMessage::neg_err(&open.id, &err.to_string()));
         } else {
             ctx.text(OutgoingMessage::notice(&err.to_string()));
         }

@@ -32,6 +32,10 @@ pub fn upper(mut key: Vec<u8>) -> Option<Vec<u8>> {
 const MAX_TAG_VALUE_SIZE: usize = 255;
 const DB_VERSION: &str = "3";
 
+/// Result of [`Iter::index_pairs`]: the `(created_at, id)` pairs, whether the
+/// scan reached the end of the matches, and the scan stats.
+pub type IndexPairs = (Vec<(u64, [u8; 32])>, bool, Stats);
+
 #[derive(Clone)]
 pub struct Db {
     inner: Lmdb,
@@ -1059,6 +1063,48 @@ where
             get_data: self.get_data,
             get_index: self.get_index,
         }
+    }
+
+    /// Collect the matching events as `(created_at, id)` pairs for NIP-77
+    /// reconciliation, reading only the index tree and never the event bodies.
+    ///
+    /// Scanning stops after `max` pairs; the returned flag is `false` when more
+    /// were available, so the caller can reject an over-large query rather than
+    /// reconcile a subset. `filter.limit` is ignored, unlike in [`Iter::size`].
+    pub fn index_pairs(mut self, max: usize) -> Result<IndexPairs> {
+        let mut pairs = Vec::new();
+        let mut complete = true;
+
+        while let Some(item) = self.group.next() {
+            let key = item?;
+            let data = self.index_data(&key)?;
+            let event = decode_event_index(data)?;
+            self.get_index += 1;
+            if let Some(event) = event {
+                // `MatchIndex::None` means the scanned index already satisfies
+                // the filter, so only the other modes need re-checking.
+                if !matches!(self.match_index, MatchIndex::None)
+                    && !self.match_index.r#match(&self.filter, event)
+                {
+                    continue;
+                }
+                if pairs.len() >= max {
+                    complete = false;
+                    break;
+                }
+                pairs.push((event.created_at(), *event.id()));
+            }
+        }
+
+        Ok((
+            pairs,
+            complete,
+            Stats {
+                get_data: 0,
+                get_index: self.get_index,
+                scan_index: self.group.scan_times,
+            },
+        ))
     }
 
     /// only count iter size

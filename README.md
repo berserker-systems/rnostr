@@ -32,6 +32,7 @@ A high-performance and scalable [nostr](https://github.com/nostr-protocol/nostr)
 - [x] NIP-45: Counting results. [experimental](#count)
 - [x] NIP-50: Keywords filter. [experimental](#search)
 - [x] NIP-70: Protected Events
+- [x] NIP-77: Negentropy syncing. [experimental](#negentropy)
 
 ### Extensions
 
@@ -64,6 +65,22 @@ When the query results are too large (millions) will trigger a slow query. `sett
 It reduces write concurrency and makes space usage significantly larger. So it is suitable for use in private or paid relay.
 
 Now we only index the content of `kind: 1` note event.
+
+#### Negentropy
+
+[NIP-77](https://nips.be/77) set reconciliation: a client and the relay work
+out which events each side is missing without transferring them all.
+
+`NEG-OPEN` is a filter query like `REQ`, so it obeys the same `[auth.req]`
+permission and `[limitation]` checks, and the search extension applies to its
+filter in the same way. It snapshots the matching `(created_at, id)` pairs once; events
+written afterwards need a new `NEG-OPEN`. Snapshots and reconciliation rounds
+run on blocking workers, and the whole matched set stays in memory (about 40
+bytes per event) until the client closes it or `idle_timeout` drops it.
+
+The limits on set size, concurrency, scan time and response size are described
+in `rnostr.example.toml`. A request over a limit gets a `NEG-ERR` whose reason
+starts with `blocked:`.
 
 ## Usage
 

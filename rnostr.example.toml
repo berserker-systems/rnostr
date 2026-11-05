@@ -144,3 +144,36 @@ enabled = false
 # use carefully. see README.md#search
 [search]
 enabled = false
+
+# NIP-77 Negentropy set reconciliation extension
+# NEG-OPEN is a filter query, so it obeys the [auth.req] permission like REQ.
+[negentropy]
+enabled = false
+
+# # Largest event set one NEG-OPEN may reconcile over; larger sets are refused
+# # with `blocked:`. Each record costs about 40 bytes of memory while open.
+# max_records = 50000
+
+# # Concurrent reconciliations allowed per connection
+# max_sessions = 4
+
+# # Relay-wide limit on queued and running reconciliation jobs; must be positive.
+# # A NEG-OPEN over the limit is refused; later rounds wait for a free slot.
+# max_jobs = 4
+
+# # Snapshot scan deadline; must be positive. A shorter [data].db_query_timeout
+# # takes precedence.
+# scan_timeout = "5s"
+
+# # Ceiling on records held across every open reconciliation, relay-wide.
+# # 0 disables it.
+# max_total_records = 1000000
+
+# # Split responses larger than this many bytes across multiple rounds; this,
+# # not max_records, bounds the size of one reply. 0 disables splitting; any
+# # other value must be at least 4096.
+# frame_size_limit = 65536
+
+# # Drop a reconciliation this long after its last message. 0 disables expiry.
+# # Reloads apply to existing reconciliations.
+# idle_timeout = "5m"
