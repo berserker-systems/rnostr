@@ -245,6 +245,19 @@ impl Extension for Auth {
                         return OutgoingMessage::closed(&sub.id, &msg).into();
                     }
                 }
+                // Reconciliation reads require the same permission as REQ.
+                IncomingMessage::NegOpen(_) | IncomingMessage::NegMsg(..) => {
+                    if let Err(err) = Self::verify_permission(
+                        self.setting.req.as_ref(),
+                        state.and_then(|s| s.pubkey()),
+                        None,
+                        None,
+                        session.ip(),
+                    ) {
+                        counter!("nostr_relay_auth_unauthorized", "command" => msg.msg.command().to_owned(), "reason" => err).increment(1);
+                        return msg.reject(format!("auth-required: {}", err));
+                    }
+                }
                 _ => {}
             }
         }
@@ -756,6 +769,82 @@ mod tests {
             .await?;
         let item = framed.next().await.unwrap()?;
         assert_eq!(item, ws::Frame::Close(Some(ws::CloseCode::Normal.into())));
+
+        Ok(())
+    }
+
+    /// NEG-OPEN requires the same read permission as REQ.
+    #[actix_rt::test]
+    async fn neg_open_requires_the_req_permission() -> Result<()> {
+        let mut rng = thread_rng();
+        let key_pair = Keypair::new_global(&mut rng);
+        let pubkey = XOnlyPublicKey::from_keypair(&key_pair).0;
+
+        let app = create_test_app("auth-neg-open")?;
+        {
+            let mut w = app.setting.write();
+            w.extra = serde_json::from_str(&format!(
+                r#"{{
+                "auth": {{
+                    "enabled": true,
+                    "req": {{
+                        "pubkey_whitelist": ["{}"]
+                    }}
+                }}
+            }}"#,
+                pubkey
+            ))?;
+        }
+        let app = app.add_extension(Auth::new());
+        let app = web::Data::new(app);
+
+        let mut srv = actix_test::start(move || create_web_app(app.clone()));
+        let mut framed = srv.ws_at("/").await.unwrap();
+
+        let state: (String, String) = parse_text(&framed.next().await.unwrap()?)?;
+        assert_eq!(state.0, "AUTH");
+
+        // Before authenticating: refused, and reported on the NIP-77 channel so
+        // the client is not left waiting for a NEG-MSG that never comes.
+        framed
+            .send(ws::Message::Text(
+                r#"["NEG-OPEN", "sync", {}, "61"]"#.into(),
+            ))
+            .await?;
+        let res: (String, String, String) = parse_text(&framed.next().await.unwrap()?)?;
+        assert_eq!(res.0, "NEG-ERR");
+        assert_eq!(res.1, "sync");
+        assert!(res.2.contains("auth-required"), "got {}", res.2);
+
+        // After authenticating as a whitelisted pubkey the auth extension lets
+        // it through; with no negentropy extension registered the core answers.
+        let event = Event::create(
+            &key_pair,
+            now(),
+            22242,
+            vec![vec!["challenge".to_owned(), state.1.clone()]],
+            "".to_owned(),
+        )?;
+        framed
+            .send(ws::Message::Text(format!(r#"["AUTH", {}]"#, event).into()))
+            .await?;
+        let ok: (String, String, bool, String) = parse_text(&framed.next().await.unwrap()?)?;
+        assert!(ok.2);
+
+        framed
+            .send(ws::Message::Text(
+                r#"["NEG-OPEN", "sync", {}, "61"]"#.into(),
+            ))
+            .await?;
+        let res: (String, String, String) = parse_text(&framed.next().await.unwrap()?)?;
+        assert_eq!(
+            res,
+            (
+                "NEG-ERR".to_owned(),
+                "sync".to_owned(),
+                "closed: reconciliation unsupported".to_owned()
+            )
+        );
 
         Ok(())
     }
