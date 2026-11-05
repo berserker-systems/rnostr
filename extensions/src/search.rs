@@ -50,6 +50,10 @@ impl Extension for Search {
                         filter.build_words();
                     }
                 }
+                // Registered before Negentropies, so this runs first.
+                IncomingMessage::NegOpen(open) => {
+                    open.filter.build_words();
+                }
                 _ => {}
             }
         }

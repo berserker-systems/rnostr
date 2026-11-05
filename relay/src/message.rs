@@ -113,6 +113,15 @@ impl ClientMessage {
                     }
                 }
             }
+
+            // Like REQ, but the extension bounds the set size, so `limit` is
+            // left alone.
+            IncomingMessage::NegOpen(open) => {
+                check_max!(open.id.len(), limitation.max_subid_length);
+                for id in open.filter.ids.iter() {
+                    check_min!(id.len(), limitation.min_prefix);
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -143,6 +152,8 @@ pub enum IncomingMessage {
     Auth(Event),
     /// nip-45
     Count(Subscription),
+    /// nip-77
+    NegOpen(NegOpen),
     Unknown(String, Vec<Value>),
 }
 
@@ -154,6 +165,7 @@ impl IncomingMessage {
             IncomingMessage::Req(_) => "REQ",
             IncomingMessage::Auth(_) => "AUTH",
             IncomingMessage::Count(_) => "COUNT",
+            IncomingMessage::NegOpen(_) => "NEG-OPEN",
             IncomingMessage::Unknown(cmd, _) => cmd,
         }
     }
@@ -165,6 +177,7 @@ impl IncomingMessage {
             IncomingMessage::Req(_) => Some("REQ"),
             IncomingMessage::Auth(_) => Some("AUTH"),
             IncomingMessage::Count(_) => Some("COUNT"),
+            IncomingMessage::NegOpen(_) => Some("NEG-OPEN"),
             IncomingMessage::Unknown(_, _) => None,
         }
     }
@@ -215,6 +228,22 @@ impl<'de> Visitor<'de> for MessageVisitor {
                 let r = Vec::<Filter>::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
                 Ok(IncomingMessage::Count(Subscription { id: t, filters: r }))
             }
+            "NEG-OPEN" => {
+                let id = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                let filter = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(2, &self))?;
+                let message = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(3, &self))?;
+                Ok(IncomingMessage::NegOpen(NegOpen {
+                    id,
+                    filter,
+                    message,
+                }))
+            }
             _ => Ok(IncomingMessage::Unknown(
                 t.to_string(),
                 Vec::<Value>::deserialize(de::value::SeqAccessDeserializer::new(seq))?,
@@ -247,6 +276,15 @@ impl<'de> Deserialize<'de> for IncomingMessage {
 pub struct Subscription {
     pub id: String,
     pub filters: Vec<Filter>,
+}
+
+/// [NIP-77](https://nips.be/77) `["NEG-OPEN", <subscription id>, <filter>, <initial message>]`
+#[derive(Clone, Debug)]
+pub struct NegOpen {
+    pub id: String,
+    pub filter: Filter,
+    /// The initial negentropy message, still hex-encoded.
+    pub message: String,
 }
 
 // https://github.com/serde-rs/serde/issues/1337
@@ -305,6 +343,11 @@ impl OutgoingMessage {
 
     pub fn ok(event_id: &str, saved: bool, message: &str) -> Self {
         Self(json!(["OK", event_id, saved, message]).to_string())
+    }
+
+    /// nip-77 error; the reconciliation is closed once this is sent
+    pub fn neg_err(sub_id: &str, message: &str) -> Self {
+        Self(json!(["NEG-ERR", sub_id, message]).to_string())
     }
 }
 
@@ -547,6 +590,53 @@ mod tests {
             matches!(msg.msg, IncomingMessage::Req(sub) if sub.filters.get(0).unwrap().limit.unwrap() == 200)
         );
 
+        let msg: IncomingMessage =
+            serde_json::from_str(r#"["NEG-OPEN", "sub_id1", {"limit": 400}, "61"]"#)?;
+        let mut msg = ClientMessage::new(1, "text".to_string(), msg);
+        msg.validate(&limitation).unwrap();
+        assert!(
+            matches!(msg.msg, IncomingMessage::NegOpen(open) if open.filter.limit == Some(400))
+        );
+
+        let msg: IncomingMessage = serde_json::from_str(&format!(
+            r#"["NEG-OPEN", "{}", {{}}, "61"]"#,
+            "x".repeat(101)
+        ))?;
+        let mut msg = ClientMessage::new(1, "text".to_string(), msg);
+        let err = msg.validate(&limitation).unwrap_err();
+        assert!(err.to_string().contains("max_subid_length"), "{err}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn de_neg_open() -> Result<()> {
+        let msg: IncomingMessage =
+            serde_json::from_str(r#"["NEG-OPEN", "sync", {"kinds": [1]}, "61"]"#)?;
+        assert!(matches!(
+            &msg,
+            IncomingMessage::NegOpen(open)
+                if open.id == "sync" && open.filter.kinds.contains(&1) && open.message == "61"
+        ));
+        assert_eq!(msg.command(), "NEG-OPEN");
+        assert_eq!(msg.known_command(), Some("NEG-OPEN"));
+
+        for text in [
+            r#"["NEG-OPEN"]"#,
+            r#"["NEG-OPEN", "sync"]"#,
+            r#"["NEG-OPEN", "sync", {}]"#,
+            r#"["NEG-OPEN", "sync", {"kinds": "invalid"}, "61"]"#,
+            r#"["NEG-OPEN", "sync", {}, 61]"#,
+            r#"["NEG-OPEN", "sync", {}, "61", "extra"]"#,
+        ] {
+            assert!(
+                serde_json::from_str::<IncomingMessage>(text).is_err(),
+                "{text}"
+            );
+        }
+
+        let msg: IncomingMessage = serde_json::from_str(r#"["NEG-MSG", "sync", "61"]"#)?;
+        assert!(matches!(msg, IncomingMessage::Unknown(ref cmd, _) if cmd == "NEG-MSG"));
         Ok(())
     }
 }

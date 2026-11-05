@@ -34,8 +34,10 @@ pub async fn relay(config: &PathBuf, watch: bool) -> Result<()> {
         .add_extension(nostr_extensions::Metrics::new())
         .add_extension(nostr_extensions::Auth::new())
         .add_extension(nostr_extensions::Ratelimiter::new())
-        .add_extension(nostr_extensions::Count::new(db))
+        .add_extension(nostr_extensions::Count::new(db.clone()))
+        // Search rewrites NEG-OPEN filters, so it must run before Negentropies.
         .add_extension(nostr_extensions::Search::new())
+        .add_extension(nostr_extensions::Negentropies::new(db))
         .web_server()?
         .await?;
     info!("Relay server shutdown");
