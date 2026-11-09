@@ -43,6 +43,7 @@ rate_limiter = ["governor"]
 count = []
 
 [dev-dependencies]
+actix-service = "2.0.2"
 actix-rt = "2.10.0"
 actix-test = "0.1.5"
 actix-web-actors = "4.3.1"

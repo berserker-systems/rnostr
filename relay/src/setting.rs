@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     any::{Any, TypeId},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     ops::Deref,
     path::{Path, PathBuf},
@@ -181,6 +181,9 @@ pub struct Setting {
     /// nip-11 extension limitation
     #[serde(skip)]
     ext_limitation: HashMap<String, Value>,
+
+    #[serde(skip)]
+    write_restrictions: HashSet<&'static str>,
 }
 
 impl PartialEq for Setting {
@@ -219,7 +222,18 @@ impl From<Setting> for SettingWrapper {
 impl SettingWrapper {
     /// reload setting from file
     pub fn reload<P: AsRef<Path>>(&self, file: P, env_prefix: Option<String>) -> Result<()> {
+        self.reload_validated(file, env_prefix, |_| Ok(()))
+    }
+
+    /// Keep the current configuration if reading or validation fails.
+    pub fn reload_validated<P: AsRef<Path>>(
+        &self,
+        file: P,
+        env_prefix: Option<String>,
+        validate: impl FnOnce(&Setting) -> Result<()>,
+    ) -> Result<()> {
         let setting = Setting::read(&file, env_prefix)?;
+        validate(&setting)?;
         {
             let mut w = self.write();
             *w = setting;
@@ -233,7 +247,24 @@ impl SettingWrapper {
         env_prefix: Option<String>,
         f: F,
     ) -> Result<Self> {
-        let mut setting: SettingWrapper = Setting::read(&file, env_prefix.clone())?.into();
+        Self::watch_validated(file, env_prefix, |_| Ok(()), f)
+    }
+
+    /// Validate candidate settings before applying them or notifying extensions.
+    pub fn watch_validated<P, V, F>(
+        file: P,
+        env_prefix: Option<String>,
+        validate: V,
+        f: F,
+    ) -> Result<Self>
+    where
+        P: AsRef<Path>,
+        V: Fn(&Setting) -> Result<()> + Send + 'static,
+        F: Fn(&SettingWrapper) + Send + 'static,
+    {
+        let initial = Setting::read(&file, env_prefix.clone())?;
+        validate(&initial)?;
+        let mut setting: SettingWrapper = initial.into();
         let c_setting = setting.clone();
 
         // let file = current_dir()?.join(file.as_ref());
@@ -258,7 +289,7 @@ impl SettingWrapper {
                     #[cfg(not(target_os = "windows"))]
                     let is_modify = matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)));
                     if is_modify && event.paths.contains(&c_file) {
-                        match c_setting.reload(&c_file, env_prefix.clone()) {
+                        match c_setting.reload_validated(&c_file, env_prefix.clone(), &validate) {
                             Ok(_) => {
                                 info!("Reload config success {:?}", c_file);
                                 info!("{:?}", c_setting.read());
@@ -307,6 +338,15 @@ impl Setting {
         self.ext_limitation.insert(key, value);
     }
 
+    /// Track each extension's contribution to NIP-11 restricted_writes.
+    pub fn set_restricted_writes(&mut self, source: &'static str, enabled: bool) {
+        if enabled {
+            self.write_restrictions.insert(source);
+        } else {
+            self.write_restrictions.remove(source);
+        }
+    }
+
     /// Parse extension setting.
     pub fn parse_extension<T: DeserializeOwned + Default>(&self, key: &str) -> T {
         self.extra
@@ -349,6 +389,9 @@ impl Setting {
         self.ext_limitation.iter().for_each(|(k, v)| {
             val["limitation"][k] = v.clone();
         });
+        if !self.write_restrictions.is_empty() {
+            val["limitation"]["restricted_writes"] = json!(true);
+        }
         self.ext_information.iter().for_each(|(k, v)| {
             val[k] = v.clone();
         });
@@ -462,6 +505,29 @@ mod tests {
     }
 
     #[test]
+    fn restricted_writes_preserves_other_extensions() -> Result<()> {
+        let mut setting = Setting::default();
+        let restricted = |setting: &Setting| -> Result<bool> {
+            let info: Value = serde_json::from_str(&setting.render_information()?)?;
+            Ok(info["limitation"]["restricted_writes"]
+                .as_bool()
+                .unwrap_or(false))
+        };
+        setting.set_restricted_writes("event_policy", true);
+        assert!(restricted(&setting)?);
+        setting.set_restricted_writes("other", true);
+        setting.set_restricted_writes("event_policy", false);
+        assert!(restricted(&setting)?);
+        setting.set_restricted_writes("other", false);
+        assert!(!restricted(&setting)?);
+        setting.add_limitation("restricted_writes".into(), json!(true));
+        setting.set_restricted_writes("event_policy", true);
+        setting.set_restricted_writes("event_policy", false);
+        assert!(restricted(&setting)?);
+        Ok(())
+    }
+
+    #[test]
     fn read() -> Result<()> {
         let setting = Setting::default();
         assert_eq!(setting.information.name, "");
@@ -532,6 +598,44 @@ mod tests {
             assert_eq!(r.information.name, "nostr");
             assert!(r.information.supported_nips.contains(&1));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn validated_watch_keeps_previous_settings_on_error() -> Result<()> {
+        use std::sync::mpsc::channel;
+
+        let file = Builder::new().suffix(".toml").tempfile()?;
+        fs::write(&file, "[information]\nname = 'initial'\n")?;
+        let (checked_tx, checked_rx) = channel();
+        let (applied_tx, applied_rx) = channel();
+        let timeout = Duration::from_secs(3);
+        let setting = SettingWrapper::watch_validated(
+            &file,
+            None,
+            move |candidate| {
+                let name = &candidate.information.name;
+                checked_tx.send(name.clone()).unwrap();
+                if name == "initial" || name == "updated" {
+                    Ok(())
+                } else {
+                    Err(Error::Message("invalid name".into()))
+                }
+            },
+            move |setting| {
+                applied_tx
+                    .send(setting.read().information.name.clone())
+                    .unwrap()
+            },
+        )?;
+        assert_eq!(checked_rx.recv_timeout(timeout)?, "initial");
+        fs::write(&file, "[information]\nname = 'invalid'\n")?;
+        while checked_rx.recv_timeout(timeout)? != "invalid" {}
+        assert_eq!(setting.read().information.name, "initial");
+        assert!(applied_rx.try_recv().is_err());
+        fs::write(&file, "[information]\nname = 'updated'\n")?;
+        assert_eq!(applied_rx.recv_timeout(timeout)?, "updated");
+        assert_eq!(setting.read().information.name, "updated");
         Ok(())
     }
 }

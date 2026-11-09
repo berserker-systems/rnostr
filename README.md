@@ -48,6 +48,14 @@ Provide metrics url for [prometheus](https://prometheus.io/) scrape
 
 [NIP-42](https://nips.be/42) Authentication, ip, auth pubkey and event pubkey whitelist blacklist
 
+#### Event policy
+
+Restrict new `EVENT` writes by kind and optional `d`-tag identifiers, after authentication and applicable rate limits. Disabled by default; configure `[event_policy]` in the [config file](./rnostr.example.toml). Existing events remain readable. Enabled policies advertise `limitation.restricted_writes` in NIP-11. An enabled empty allowlist rejects all writes. Explicit `enabled = false` ignores other policy fields.
+
+Identifier restrictions apply only to allowed kinds 30000–39999. Storage and policy use the first `d` tag wherever it appears; a missing tag or value means `""`. Other allowed kinds have no identifier restriction.
+
+Invalid policies prevent startup. With `--watch`, an invalid reload keeps the previous configuration and logs an error.
+
 #### Rate limiter
 
 Limit event write frequency.

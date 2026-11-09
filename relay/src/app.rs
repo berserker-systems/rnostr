@@ -115,6 +115,7 @@ impl App {
     ) -> Result<Self> {
         let extensions = Arc::new(RwLock::new(Extensions::default()));
         let c_extensions = Arc::clone(&extensions);
+        let validators = Arc::clone(&extensions);
         let env_notice = setting_env_prefix
             .as_ref()
             .map(|s| {
@@ -128,10 +129,12 @@ impl App {
         let setting = if watch && setting_path.is_some() {
             let path = setting_path.as_ref().unwrap().as_ref();
             info!("Watch config file {:?}{}", path, env_notice);
-            SettingWrapper::watch(path, setting_env_prefix, move |s| {
-                let mut w = c_extensions.write();
-                w.call_setting(s);
-            })?
+            SettingWrapper::watch_validated(
+                path,
+                setting_env_prefix,
+                move |s| validators.read().validate_setting(s),
+                move |s| c_extensions.write().call_setting(s),
+            )?
         } else if let Some(path) = setting_path {
             info!("Load config {:?}{}", path.as_ref(), env_notice);
             Setting::read(path.as_ref(), setting_env_prefix)?.into()
@@ -176,6 +179,12 @@ impl App {
         self
     }
 
+    fn validate_extensions(&self) -> Result<()> {
+        self.extensions
+            .read()
+            .validate_setting(&self.setting.read())
+    }
+
     pub fn web_app(
         self,
     ) -> WebApp<
@@ -191,6 +200,7 @@ impl App {
     }
 
     pub fn web_server(self) -> Result<actix_web::dev::Server, std::io::Error> {
+        self.validate_extensions().map_err(std::io::Error::other)?;
         let r = self.setting.read();
         let num = if r.thread.http == 0 {
             num_cpus::get()
@@ -222,7 +232,9 @@ pub fn create_web_app(
 > {
     let app = WebApp::new();
     let extensions = data.extensions.clone();
-    app.app_data(data)
+    app.app_data(data.clone())
+        // A failed data factory prevents this worker from accepting requests.
+        .data_factory(move || std::future::ready(data.validate_extensions()))
         .configure(|cfg| {
             extensions.write().call_config_web(cfg);
         })

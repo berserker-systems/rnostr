@@ -24,6 +24,11 @@ impl From<OutgoingMessage> for ExtensionMessageResult {
 pub trait Extension: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// Validate a candidate configuration before applying it.
+    fn validate_setting(&self, _setting: &crate::Setting) -> crate::Result<()> {
+        Ok(())
+    }
+
     /// Execute when added to extension list and setting reload
     #[allow(unused_variables)]
     fn setting(&mut self, setting: &SettingWrapper) {}
@@ -67,6 +72,13 @@ impl Extensions {
         for ext in &mut self.list {
             ext.setting(setting);
         }
+    }
+
+    pub fn validate_setting(&self, setting: &crate::Setting) -> crate::Result<()> {
+        for ext in &self.list {
+            ext.validate_setting(setting)?;
+        }
+        Ok(())
     }
 
     pub fn call_config_web(&mut self, cfg: &mut ServiceConfig) {
