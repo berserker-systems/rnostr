@@ -2663,16 +2663,17 @@ mod tests {
         let res: Reply = recv(&mut framed).await?;
         assert_eq!(res.0, NEG_ERR);
         assert!(res.2.starts_with("auth-required:"));
-        send(&mut framed, json!([NEG_MSG, "sync", "61"])).await?;
-        let res: Reply = recv(&mut framed).await?;
-        assert_eq!(res.0, NEG_ERR);
-        assert_eq!(res.2, "closed: no such reconciliation");
 
         app.setting
             .write()
             .extra
             .insert("auth".to_owned(), json!({"enabled": false}));
         app.extensions.write().call_setting(&app.setting);
+        send(&mut framed, json!([NEG_MSG, "sync", "61"])).await?;
+        let res: Reply = recv(&mut framed).await?;
+        assert_eq!(res.0, NEG_ERR);
+        assert_eq!(res.2, "closed: no such reconciliation");
+
         send(&mut framed, json!([NEG_OPEN, "released", {}, "61"])).await?;
         let res: Reply = recv(&mut framed).await?;
         assert_eq!(res.0, NEG_MSG, "budget should be released: {res:?}");
