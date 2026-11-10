@@ -56,6 +56,13 @@ impl Session {
             .and_then(|boxed| boxed.downcast_ref())
     }
 
+    /// get extension data for in-place mutation
+    pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        self.data
+            .get_mut(&TypeId::of::<T>())
+            .and_then(|boxed| boxed.downcast_mut())
+    }
+
     /// Get session id
     pub fn id(&self) -> usize {
         self.id
@@ -103,26 +110,33 @@ impl Session {
         });
     }
 
-    fn send_error(
-        &self,
-        err: crate::Error,
-        msg: &ClientMessage,
+    fn reject(
+        &mut self,
+        target: RejectionTarget,
+        reason: &str,
         ctx: &mut ws::WebsocketContext<Self>,
     ) {
-        if let IncomingMessage::Event(event) = &msg.msg {
-            ctx.text(OutgoingMessage::ok(
-                &event.id_str(),
-                false,
-                &err.to_string(),
-            ));
-        } else if let IncomingMessage::Req(sub) = &msg.msg {
-            ctx.text(OutgoingMessage::closed(&sub.id, &err.to_string()));
-        } else {
-            ctx.text(OutgoingMessage::notice(&err.to_string()));
-        }
+        ctx.text(
+            self.app
+                .clone()
+                .extensions
+                .read()
+                .reject(&target, reason, self),
+        );
     }
 
     fn handle_message(&mut self, text: String, ctx: &mut ws::WebsocketContext<Self>) {
+        if text.len() > self.app.setting.read().limitation.max_message_length {
+            if let Some((command, id)) = reconciliation_prefix(&text) {
+                counter!("nostr_relay_message_total", "command" => command).increment(1);
+                self.reject(
+                    RejectionTarget::Reconciliation(id),
+                    "invalid: message too long",
+                    ctx,
+                );
+                return;
+            }
+        }
         let msg = serde_json::from_str::<IncomingMessage>(&text);
         match msg {
             Ok(msg) => {
@@ -131,39 +145,33 @@ impl Session {
                     counter!("nostr_relay_message_total", "command" => cmd).increment(1);
                 }
 
-                let mut msg = ClientMessage::new(self.id, text, msg);
-                {
-                    let r = self.app.setting.read();
-                    if let Err(err) = msg.validate(&r.limitation) {
-                        self.send_error(err, &msg, ctx);
-                        return;
-                    }
-                }
+                let msg = ClientMessage::new(self.id, text, msg);
 
-                match self
+                let result = self
                     .app
                     .clone()
                     .extensions
                     .read()
-                    .call_message(msg, self, ctx)
-                {
-                    crate::ExtensionMessageResult::Continue(msg) => {
-                        if let Err(err) = msg.validate_nip70() {
-                            self.send_error(err, &msg, ctx);
-                            return;
-                        }
-                        self.server.do_send(msg);
+                    .call_message(msg, self, ctx);
+                if let Some(msg) = result {
+                    if let Err(err) = msg.validate_nip70() {
+                        self.reject(msg.msg.rejection_target(), &err.to_string(), ctx);
+                        return;
                     }
-                    crate::ExtensionMessageResult::Stop(out) => {
-                        ctx.text(out);
-                    }
-                    crate::ExtensionMessageResult::Ignore => {
-                        // ignore
-                    }
-                };
+                    self.server.do_send(msg);
+                }
             }
             Err(err) => {
-                ctx.text(OutgoingMessage::notice(&format!("json error: {}", err)));
+                if let Some((command, id)) = reconciliation_prefix(&text) {
+                    counter!("nostr_relay_message_total", "command" => command).increment(1);
+                    self.reject(
+                        RejectionTarget::Reconciliation(id),
+                        &format!("invalid: {err}"),
+                        ctx,
+                    );
+                } else {
+                    self.reject(RejectionTarget::Notice, &format!("json error: {err}"), ctx);
+                }
             }
         };
     }
@@ -315,6 +323,162 @@ mod tests {
     use anyhow::Result;
     use bytes::Bytes;
     use futures_util::{SinkExt as _, StreamExt as _};
+
+    #[actix_rt::test]
+    async fn unsupported_reconciliations_keep_their_ids() -> Result<()> {
+        for text in [
+            r#"["NEG-OPEN","sync",{},"61"]"#,
+            r#"["NEG-MSG","sync","61"]"#,
+        ] {
+            let app = web::Data::new(create_test_app("unsupported-negentropy")?);
+            let stream =
+                ws::WebsocketContext::with_factory(futures_util::stream::pending(), move |ctx| {
+                    let mut session = Session::new("test".to_owned(), app);
+                    StreamHandler::handle(&mut session, Ok(ws::Message::Text(text.into())), ctx);
+                    session
+                });
+            futures_util::pin_mut!(stream);
+            let frame = stream.next().await.unwrap().unwrap();
+            let bytes: &[u8] = frame.as_ref();
+            let expected = br#"["NEG-ERR","sync","closed: reconciliation unsupported"]"#;
+            assert!(bytes.windows(expected.len()).any(|part| part == expected));
+        }
+        Ok(())
+    }
+
+    #[actix_rt::test]
+    async fn oversized_event_and_req_keep_their_error_responses() -> Result<()> {
+        use serde_json::json;
+        let event = crate::db::Event::new([1; 32], [2; 32], 1, 1, vec![], String::new(), [3; 64])?;
+        for (value, prefix) in [
+            (
+                json!(["EVENT", event]),
+                format!(r#"["OK","{}",false,"#, "01".repeat(32)),
+            ),
+            (
+                json!(["REQ", "sync", {}]),
+                r#"["CLOSED","sync","#.to_owned(),
+            ),
+        ] {
+            for fragmented in [false, true] {
+                let app = web::Data::new(create_test_app("oversized-message-replies")?);
+                let text = value.to_string();
+                let stream = ws::WebsocketContext::with_factory(
+                    futures_util::stream::pending(),
+                    move |ctx| {
+                        let mut session = Session::new("test".to_owned(), app.clone());
+                        app.setting.write().limitation.max_message_length = 1;
+                        if fragmented {
+                            let split = text.len() / 2;
+                            for item in [
+                                Item::FirstText(Bytes::copy_from_slice(&text.as_bytes()[..split])),
+                                Item::Last(Bytes::copy_from_slice(&text.as_bytes()[split..])),
+                            ] {
+                                StreamHandler::handle(
+                                    &mut session,
+                                    Ok(ws::Message::Continuation(item)),
+                                    ctx,
+                                );
+                            }
+                        } else {
+                            StreamHandler::handle(
+                                &mut session,
+                                Ok(ws::Message::Text(text.into())),
+                                ctx,
+                            );
+                        }
+                        session
+                    },
+                );
+                futures_util::pin_mut!(stream);
+                let frame = stream.next().await.unwrap().unwrap();
+                let bytes: &[u8] = frame.as_ref();
+                assert!(bytes
+                    .windows(prefix.len())
+                    .any(|part| part == prefix.as_bytes()));
+                assert!(bytes.windows(18).any(|part| part == b"max_message_length"));
+            }
+        }
+        Ok(())
+    }
+
+    #[actix_rt::test]
+    async fn neg_open_errors_do_not_reflect_large_ids_or_payloads() -> Result<()> {
+        use serde_json::json;
+        for (value, limit, response, reason) in [
+            (
+                json!(["NEG-OPEN", "i".repeat(1024), {}, "61"]),
+                4096,
+                "NOTICE",
+                "max_subid_length",
+            ),
+            (
+                json!(["NEG-OPEN", "i".repeat(1024), {"kinds": "x"}, "61"]),
+                4096,
+                "NOTICE",
+                "invalid type",
+            ),
+            (
+                json!(["NEG-OPEN", "i".repeat(1024), {}, "61"]),
+                64,
+                "NOTICE",
+                "message too long",
+            ),
+            (
+                json!(["NEG-OPEN", "id", {"kinds": "x".repeat(1024)}, "61"]),
+                4096,
+                "NEG-ERR",
+                "invalid type",
+            ),
+            (
+                json!(["NEG-OPEN", "id", {"kinds": "x".repeat(1024)}, "61"]),
+                64,
+                "NEG-ERR",
+                "message too long",
+            ),
+        ] {
+            let app = web::Data::new(create_test_app("neg-error-bounds")?);
+            app.setting.write().limitation.max_message_length = limit;
+            app.setting.write().limitation.max_subid_length = 16;
+            let stream =
+                ws::WebsocketContext::with_factory(futures_util::stream::pending(), move |ctx| {
+                    let mut session = Session::new("test".to_owned(), app);
+                    StreamHandler::handle(
+                        &mut session,
+                        Ok(ws::Message::Text(value.to_string().into())),
+                        ctx,
+                    );
+                    session
+                });
+            futures_util::pin_mut!(stream);
+            let frame = stream.next().await.unwrap().unwrap();
+            let bytes: &[u8] = frame.as_ref();
+            assert!(bytes.len() < 512);
+            assert!(bytes
+                .windows(response.len())
+                .any(|part| part == response.as_bytes()));
+            assert!(bytes
+                .windows(reason.len())
+                .any(|part| part == reason.as_bytes()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_prefix_does_not_parse_the_body() {
+        for command in ["NEG-OPEN", "NEG-MSG", "NEG-CLOSE"] {
+            for suffix in [",invalid", ",123]", ""] {
+                let text = format!(r#"["{command}","x"{suffix}"#);
+                assert_eq!(
+                    reconciliation_prefix(&text),
+                    Some((command, "x".to_owned()))
+                );
+            }
+        }
+        for text in [r#"["REQ","x",{}]"#, r#"["NEG-OPEN",123,{}]"#, "invalid"] {
+            assert!(reconciliation_prefix(text).is_none());
+        }
+    }
 
     #[actix_rt::test]
     async fn pingpong() -> Result<()> {

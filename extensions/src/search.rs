@@ -5,7 +5,7 @@ use nostr_relay::{
 };
 use serde::Deserialize;
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Clone)]
 pub struct SearchSetting {
     pub enabled: bool,
 }
@@ -29,6 +29,7 @@ impl Extension for Search {
     fn setting(&mut self, setting: &SettingWrapper) {
         let mut w = setting.write();
         self.setting = w.parse_extension(self.name());
+        w.set_extension(self.setting.clone());
         if self.setting.enabled {
             w.add_nip(50);
         }

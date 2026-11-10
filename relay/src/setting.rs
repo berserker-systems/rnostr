@@ -219,9 +219,11 @@ impl From<Setting> for SettingWrapper {
 impl SettingWrapper {
     /// reload setting from file
     pub fn reload<P: AsRef<Path>>(&self, file: P, env_prefix: Option<String>) -> Result<()> {
-        let setting = Setting::read(&file, env_prefix)?;
+        let mut setting = Setting::read(&file, env_prefix)?;
         {
             let mut w = self.write();
+            // Keep applied extension policies available until their reload callbacks run.
+            setting.extensions = std::mem::take(&mut w.extensions);
             *w = setting;
         }
         Ok(())
@@ -502,6 +504,20 @@ mod tests {
                 assert_eq!(setting.network.port, 1);
             },
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reload_retains_extension_policy_until_refreshed() -> Result<()> {
+        let setting: SettingWrapper = Setting::default().into();
+        setting.write().set_extension(7u64);
+        let file = Builder::new().suffix(".toml").tempfile()?;
+        fs::write(file.path(), "[limitation]\nmax_message_length = 4096\n")?;
+        setting.reload(file.path(), None)?;
+        assert_eq!(setting.read().limitation.max_message_length, 4096);
+        assert_eq!(setting.read().get_extension::<u64>(), Some(&7));
+        setting.write().set_extension(8u64);
+        assert_eq!(setting.read().get_extension::<u64>(), Some(&8));
         Ok(())
     }
 

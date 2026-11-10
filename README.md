@@ -32,6 +32,7 @@ A high-performance and scalable [nostr](https://github.com/nostr-protocol/nostr)
 - [x] NIP-45: Counting results. [experimental](#count)
 - [x] NIP-50: Keywords filter. [experimental](#search)
 - [x] NIP-70: Protected Events
+- [x] NIP-77: Negentropy syncing. [experimental](#negentropy)
 
 ### Extensions
 
@@ -65,6 +66,40 @@ It reduces write concurrency and makes space usage significantly larger. So it i
 
 Now we only index the content of `kind: 1` note event.
 
+#### Negentropy
+
+[NIP-77](https://nips.be/77) set reconciliation: a client and the relay work
+out which events each side is missing without transferring them all.
+
+`NEG-OPEN` is a filter query like `REQ`, so it obeys the same `[auth.req]`
+permission and `[limitation]` checks, and the search extension applies to its
+filter in the same way. An explicit filter `limit` is rejected with `NEG-ERR`;
+reconciliation covers the whole matching set. It snapshots the matching
+`(created_at, id)` pairs once; events
+written afterwards need a new `NEG-OPEN`. Snapshots and reconciliation rounds
+run on blocking workers, and the whole matched set stays in memory (about 40
+bytes per retained event) until the client closes it or `idle_timeout` drops it.
+Snapshot construction temporarily uses additional memory.
+
+Search reconciliations require an enabled Search extension; registration order
+does not matter. Invalid negentropy fields retain their previous valid values,
+using defaults at startup; valid edits still apply and missing fields reset to
+defaults. A malformed section retains the previous configuration. Invalid
+`enabled` values log an error with the retained state.
+
+The limits on set size, concurrency, scan time and response size are described
+in `rnostr.example.toml`. Exceeding these reconciliation limits gets a `NEG-ERR`
+whose reason starts with `blocked:`. Oversized WebSocket frames can be rejected
+before the command and ID are parsed, resulting in a `NOTICE` instead.
+
+Closing or replacing an ID invalidates its pending replies immediately. Workers
+keep their job slots until they exit. Changing `max_jobs` requires a restart;
+`max_sessions` changes apply to new connections. `idle_timeout` remains live
+and excludes time spent waiting for or running relay work.
+Disabling refuses new `NEG-OPEN` and `NEG-MSG` requests; accepted work can finish.
+Existing state remains until a request is rejected, the client closes it, idle
+expiry, or disconnect, and can survive a quick disable/re-enable.
+
 ## Usage
 
 ### Prepare source and config
@@ -94,6 +129,22 @@ cargo build --release
 ./target/release/rnostr relay -c ./config/rnostr.toml --watch
 
 ```
+
+Japanese and Korean search tokenization are enabled by default. Their dictionaries
+are downloaded by Lindera build scripts during compilation. To build without
+these downloads, while keeping search and the other relay extensions enabled:
+
+```shell
+cargo build --release --no-default-features
+```
+
+Enable either language separately with `--features search-japanese` or
+`--features search-korean`; those features require the corresponding dictionary
+downloads. `--offline` only controls Cargo itself, so it does not prevent build
+scripts from downloading dictionaries when these features are enabled.
+
+When building or testing the whole workspace, also use `--no-default-features`
+to prevent benchmark defaults from enabling the dictionaries.
 
 ### Docker
 
