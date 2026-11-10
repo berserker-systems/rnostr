@@ -1459,6 +1459,10 @@ mod tests {
         for pending in [false, true] {
             for (request, reply) in [
                 (
+                    json!([NEG_OPEN, "x", {"limit": 1}, "61"]).to_string(),
+                    r#"["NEG-ERR","x","invalid: limit is not supported"]"#,
+                ),
+                (
                     json!([NEG_OPEN, "x", {"kinds": "bad"}, "61"]).to_string(),
                     NEG_ERR,
                 ),

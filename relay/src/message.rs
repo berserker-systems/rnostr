@@ -119,10 +119,11 @@ impl ClientMessage {
                 }
             }
 
-            // Like REQ, but the extension bounds the set size, so `limit` is
-            // left alone.
             IncomingMessage::NegOpen(open) => {
                 check_max!(open.id.len(), limitation.max_subid_length);
+                if open.filter.limit.is_some() {
+                    return Err(Error::Invalid("limit is not supported".to_owned()));
+                }
             }
             IncomingMessage::NegMsg(id, _) | IncomingMessage::NegClose(id) => {
                 check_max!(id.len(), limitation.max_subid_length);
@@ -708,13 +709,15 @@ mod tests {
             matches!(msg.msg, IncomingMessage::Req(sub) if sub.filters.get(0).unwrap().limit.unwrap() == 200)
         );
 
-        let msg: IncomingMessage =
-            serde_json::from_str(r#"["NEG-OPEN", "sub_id1", {"limit": 400}, "61"]"#)?;
-        let mut msg = ClientMessage::new(1, "text".to_string(), msg);
-        msg.validate(&limitation).unwrap();
-        assert!(
-            matches!(msg.msg, IncomingMessage::NegOpen(open) if open.filter.limit == Some(400))
-        );
+        for limit in [0, 100, 400, u64::MAX] {
+            let text = json!([NEG_OPEN, "sub_id1", {"limit": limit}, "61"]).to_string();
+            let msg = serde_json::from_str(&text)?;
+            let mut msg = ClientMessage::new(1, text, msg);
+            assert_eq!(
+                msg.validate(&limitation).unwrap_err().to_string(),
+                "invalid: limit is not supported"
+            );
+        }
 
         let msg: IncomingMessage = serde_json::from_str(&format!(
             r#"["NEG-OPEN", "{}", {{}}, "61"]"#,

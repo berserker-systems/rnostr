@@ -73,7 +73,9 @@ out which events each side is missing without transferring them all.
 
 `NEG-OPEN` is a filter query like `REQ`, so it obeys the same `[auth.req]`
 permission and `[limitation]` checks, and the search extension applies to its
-filter in the same way. It snapshots the matching `(created_at, id)` pairs once; events
+filter in the same way. An explicit filter `limit` is rejected with `NEG-ERR`;
+reconciliation covers the whole matching set. It snapshots the matching
+`(created_at, id)` pairs once; events
 written afterwards need a new `NEG-OPEN`. Snapshots and reconciliation rounds
 run on blocking workers, and the whole matched set stays in memory (about 40
 bytes per retained event) until the client closes it or `idle_timeout` drops it.
